@@ -92,10 +92,12 @@ CUSTOM_CSS = f"""
     .kpi-card {{
         background: {CARD_BG};
         border-radius: 14px;
-        padding: 16px 18px 12px 18px;
+        padding: 16px 18px 14px 18px;
         box-shadow: 0 1px 3px rgba(15,23,41,0.06);
         border: 1px solid {BORDER};
-        height: 108px;
+        min-height: 108px;
+        overflow: visible;
+        margin-bottom: 4px;
     }}
     .kpi-label {{
         font-size: 0.72rem;
@@ -180,6 +182,29 @@ CUSTOM_CSS = f"""
         background: {INK};
         color: white;
         border: none;
+    }}
+
+    /* Give multiselect (QA / Years / Months / Weeks) and date-input dropdowns
+       a visible rounded border so they read as proper closed input fields. */
+    div[data-baseweb="select"] > div {{
+        border: 1.5px solid {BORDER} !important;
+        border-radius: 10px !important;
+        box-shadow: none !important;
+    }}
+    div[data-baseweb="select"] > div:focus-within {{
+        border-color: {ACCENT} !important;
+    }}
+    div[data-testid="stDateInput"] > div {{
+        border: 1.5px solid {BORDER} !important;
+        border-radius: 10px !important;
+    }}
+    div[data-testid="stDateInput"] input {{
+        border: none !important;
+    }}
+
+    /* Breathing room after the KPI summary row, before the next panel/card */
+    .kpi-row-spacer {{
+        height: 20px;
     }}
 </style>
 """
@@ -556,7 +581,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
     return buf
 
 
-def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
+def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_figs):
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
@@ -663,6 +688,49 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     elements.append(tbl)
+
+    # ---- Daily Log (mirrors the on-screen Daily Log table) ----
+    elements.append(PageBreak())
+    elements.append(Paragraph("Daily Log", h2_style))
+    elements.append(Paragraph(
+        f"{len(detail_df):,} rows &middot; sorted by date, most recent first",
+        sub_style))
+    elements.append(Spacer(1, 4))
+
+    log_for_pdf = detail_df.copy().sort_values("Date", ascending=False)
+    log_for_pdf["Date"] = pd.to_datetime(log_for_pdf["Date"]).dt.strftime("%Y-%m-%d")
+    log_cols = ["Date", "Day", "QA Name", "Billable Hours", "Non-Billable Hours",
+                "Hours Not Worked", "Total Hours", "Comment"]
+    log_for_pdf = log_for_pdf[log_cols]
+
+    # Cap rows rendered directly in the PDF table for file-size/perf sanity;
+    # the full, uncapped data is always in the companion Excel export.
+    MAX_PDF_LOG_ROWS = 500
+    truncated = len(log_for_pdf) > MAX_PDF_LOG_ROWS
+    log_for_pdf_show = log_for_pdf.head(MAX_PDF_LOG_ROWS)
+
+    log_table_data = [log_cols] + log_for_pdf_show.round(2).astype(str).values.tolist()
+    log_col_widths = [70, 40, 90, 65, 75, 70, 65, 300]
+    log_tbl = Table(log_table_data, colWidths=log_col_widths, repeatRows=1)
+    log_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
+        ("ALIGN", (0, 0), (6, -1), "CENTER"),
+        ("ALIGN", (7, 0), (7, -1), "LEFT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    elements.append(log_tbl)
+    if truncated:
+        elements.append(Spacer(1, 6))
+        elements.append(Paragraph(
+            f"Showing the most recent {MAX_PDF_LOG_ROWS:,} of {len(log_for_pdf):,} rows. "
+            "Download the Excel export for the complete daily log.",
+            sub_style))
 
     doc.build(elements)
     buf.seek(0)
@@ -810,6 +878,8 @@ for col, label, val, sub in kpi_cells:
         </div>
         """, unsafe_allow_html=True)
 
+st.markdown('<div class="kpi-row-spacer"></div>', unsafe_allow_html=True)
+
 # ============================================================================
 # CHARTS - TEAM LEVEL
 # ============================================================================
@@ -920,7 +990,7 @@ if prepare_clicked:
         st.session_state["export_excel_bytes"] = to_excel_bytes(
             export_summary, export_detail, kpis, period_label, team_chart_figs, qa_mini_figs)
         st.session_state["export_pdf_bytes"] = to_pdf_bytes(
-            export_summary, kpis, period_label, team_chart_figs, qa_mini_figs)
+            export_summary, export_detail, kpis, period_label, team_chart_figs, qa_mini_figs)
         st.session_state["export_period_label"] = period_label
     st.success("Exports ready below \u2014 changing filters now will NOT regenerate them until you click Prepare Exports again.")
 
