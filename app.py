@@ -3,9 +3,10 @@ QA Work-Hours Analytics Dashboard
 ----------------------------------
 A single-page Streamlit dashboard for analyzing QA team work-hour trackers.
 
-Upload the QA tracker workbook -> get instant KPI summary + charts
-(Donut, Waffle, Range, Bar/Column) -> filter Daily / Monthly / Yearly ->
-export to Excel or PDF.
+Upload the QA tracker workbook -> instant KPI summary + charts (line trend,
+daily intensity grid, QA comparison bars, hours mix, searchable daily log) ->
+filter by QA / Year / Month / Week / Day (multi-select + calendar) -> click
+"Prepare Export" once to build Excel/PDF snapshots of exactly what's on screen.
 
 Run:  streamlit run app.py
 """
@@ -13,12 +14,11 @@ Run:  streamlit run app.py
 import io
 import re
 import warnings
-from datetime import datetime
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import streamlit as st
 
 warnings.filterwarnings("ignore")
@@ -27,125 +27,159 @@ warnings.filterwarnings("ignore")
 # PAGE CONFIG & GLOBAL STYLE
 # ============================================================================
 st.set_page_config(
-    page_title="QA Work Hours Dashboard",
+    page_title="QA Hours Dashboard",
     page_icon="\U0001F4CA",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-PRIMARY = "#5B5FEF"
-PRIMARY_DARK = "#3E42C9"
-BILLABLE_COLOR = "#22C55E"
-NONBILL_COLOR = "#F59E0B"
-NOTWORKED_COLOR = "#EF4444"
-BG_CARD = "#FFFFFF"
-TEXT_MUTED = "#6B7280"
+# ---- Palette (matches the reference screenshot: dark navy header, teal/slate accents) ----
+INK = "#0F1729"           # dark navy header background
+INK_TEXT = "#E7EAF3"
+PAGE_BG = "#F4F5F8"
+CARD_BG = "#FFFFFF"
+BORDER = "#E7E9F0"
+TEXT_MAIN = "#1F2333"
+TEXT_MUTED = "#7A7F91"
+
+BILLABLE_COLOR = "#2F9E8F"     # teal
+NONBILL_COLOR = "#E0A72E"      # amber
+NOTWORKED_COLOR = "#C1543D"    # brick red
+ACCENT = "#2F9E8F"
+
+QA_PALETTE = ["#2F9E8F", "#D97A46", "#6E7FC9", "#C1543D",
+              "#8E9257", "#DCB13A", "#4C7A96", "#9C6FA6"]
 
 CUSTOM_CSS = f"""
 <style>
     .stApp {{
-        background: linear-gradient(180deg, #F7F8FC 0%, #EEF0FA 100%);
+        background: {PAGE_BG};
     }}
     #MainMenu {{visibility: hidden;}}
     footer {{visibility: hidden;}}
-    /* Keep the header bar itself functional (it contains the sidebar
-       expand/collapse arrow) but make it visually blend into the page. */
     header[data-testid="stHeader"] {{
         background: transparent;
         height: 3rem;
     }}
-
-    .app-title {{
-        font-size: 2.1rem;
-        font-weight: 800;
-        color: #1F2340;
-        margin-bottom: 0px;
+    .block-container {{
+        padding-top: 1rem !important;
+        padding-bottom: 3rem !important;
+        max-width: 1400px;
     }}
-    .app-subtitle {{
-        color: {TEXT_MUTED};
-        font-size: 0.95rem;
-        margin-top: -6px;
-        margin-bottom: 1.2rem;
+
+    /* Top banner mimicking the reference design */
+    .top-banner {{
+        background: {INK};
+        border-radius: 16px;
+        padding: 18px 28px;
+        margin-bottom: 20px;
+        color: {INK_TEXT};
+    }}
+    .top-banner .eyebrow {{
+        font-size: 0.7rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: #8B93AD;
+        font-weight: 600;
+        margin-bottom: 2px;
+    }}
+    .top-banner .title {{
+        font-size: 1.5rem;
+        font-weight: 800;
+        color: #FFFFFF;
     }}
 
     .kpi-card {{
-        background: {BG_CARD};
-        border-radius: 16px;
-        padding: 18px 20px 14px 20px;
-        box-shadow: 0 4px 18px rgba(31,35,64,0.06);
-        border: 1px solid #ECEDF7;
-        text-align: left;
-        height: 118px;
+        background: {CARD_BG};
+        border-radius: 14px;
+        padding: 16px 18px 12px 18px;
+        box-shadow: 0 1px 3px rgba(15,23,41,0.06);
+        border: 1px solid {BORDER};
+        height: 108px;
     }}
     .kpi-label {{
-        font-size: 0.78rem;
-        font-weight: 600;
+        font-size: 0.72rem;
+        font-weight: 700;
         color: {TEXT_MUTED};
         text-transform: uppercase;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.05em;
         margin-bottom: 6px;
     }}
     .kpi-value {{
-        font-size: 1.9rem;
+        font-size: 1.8rem;
         font-weight: 800;
-        color: #1F2340;
+        color: {TEXT_MAIN};
         line-height: 1.1;
     }}
+    .kpi-value .unit {{
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: {TEXT_MUTED};
+        margin-left: 3px;
+    }}
     .kpi-sub {{
-        font-size: 0.78rem;
+        font-size: 0.74rem;
         color: {TEXT_MUTED};
         margin-top: 4px;
     }}
-    .section-header {{
-        font-size: 1.25rem;
-        font-weight: 700;
-        color: #1F2340;
-        margin-top: 1.6rem;
-        margin-bottom: 0.4rem;
-        border-left: 5px solid {PRIMARY};
-        padding-left: 10px;
-    }}
-    .qa-card {{
-        background: {BG_CARD};
+
+    .panel {{
+        background: {CARD_BG};
         border-radius: 16px;
-        padding: 16px 18px;
-        box-shadow: 0 4px 18px rgba(31,35,64,0.06);
-        border: 1px solid #ECEDF7;
-        margin-bottom: 14px;
+        padding: 20px 22px;
+        box-shadow: 0 1px 3px rgba(15,23,41,0.06);
+        border: 1px solid {BORDER};
+        margin-bottom: 20px;
     }}
-    .qa-name {{
+    .panel-title {{
         font-size: 1.05rem;
         font-weight: 800;
-        color: #1F2340;
+        color: {TEXT_MAIN};
     }}
-    .badge {{
-        display:inline-block;
-        padding: 3px 10px;
-        border-radius: 999px;
-        font-size: 0.72rem;
-        font-weight: 700;
-        margin-left: 8px;
+    .panel-sub {{
+        font-size: 0.78rem;
+        color: {TEXT_MUTED};
     }}
-    .badge-good {{ background:#DCFCE7; color:#16A34A; }}
-    .badge-warn {{ background:#FEF3C7; color:#D97706; }}
-    .badge-bad  {{ background:#FEE2E2; color:#DC2626; }}
+
+    .qa-card {{
+        background: {CARD_BG};
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 3px rgba(15,23,41,0.06);
+        border: 1px solid {BORDER};
+        margin-bottom: 12px;
+    }}
+    .qa-name {{
+        font-size: 1.0rem;
+        font-weight: 800;
+        color: {TEXT_MAIN};
+    }}
 
     div[data-testid="stFileUploader"] {{
-        background: {BG_CARD};
-        border-radius: 16px;
-        padding: 14px;
-        border: 1.5px dashed #C7CAEF;
+        background: {CARD_BG};
+        border-radius: 14px;
+        padding: 12px;
+        border: 1.5px dashed #C9CEDD;
     }}
 
-    /* Give the page some breathing room so charts don't touch the bottom edge */
-    .block-container {{
-        padding-bottom: 4rem !important;
-        padding-top: 1rem !important;
+    .modebar {{ display: none !important; }}
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {{
+        background: {CARD_BG};
+        border-right: 1px solid {BORDER};
     }}
 
-    /* Hide Plotly's floating toolbar (camera/zoom/pan) to prevent accidental clicks */
-    .modebar {{
-        display: none !important;
+    .stButton > button {{
+        border-radius: 10px;
+        font-weight: 700;
+    }}
+    div[data-testid="stDownloadButton"] > button {{
+        border-radius: 10px;
+        font-weight: 700;
+        background: {INK};
+        color: white;
+        border: none;
     }}
 </style>
 """
@@ -154,19 +188,15 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-# Disable the floating Plotly toolbar (camera/zoom/pan) everywhere so users
-# can't accidentally trigger it while scrolling/clicking on charts.
+# Disable Plotly's floating toolbar everywhere (prevents accidental clicks).
 PLOTLY_CONFIG = {"displayModeBar": False, "displaylogo": False, "scrollZoom": False}
+
+TODAY = pd.Timestamp(datetime.now().date())
 
 # ============================================================================
 # DATA LOADING & CLEANING
 # ============================================================================
 
-REQUIRED_CANON = ["QA Name", "Date", "Day", "Month",
-                   "Billable Hours", "Non-Billable Hours",
-                   "Hours Not Worked", "Total Hours"]
-
-# Map of messy possible header text -> canonical column name
 HEADER_ALIASES = {
     "enter qa name here": "QA Name",
     "qa name": "QA Name",
@@ -192,7 +222,6 @@ def _norm(s):
 
 
 def _find_header_row(raw: pd.DataFrame, max_scan: int = 5):
-    """Scan first few rows to find the row that looks like column headers."""
     for i in range(min(max_scan, len(raw))):
         row_vals = [_norm(v) for v in raw.iloc[i].tolist()]
         hits = sum(1 for v in row_vals if v in HEADER_ALIASES)
@@ -216,7 +245,8 @@ def _to_number(x):
 
 
 def parse_workbook(file) -> pd.DataFrame:
-    """Read every per-QA sheet in the workbook and return one tidy dataframe."""
+    """Read every per-QA sheet in the workbook and return one tidy dataframe.
+    Rows dated after today are dropped, even if present in the source file."""
     xls = pd.ExcelFile(file)
     frames = []
 
@@ -237,41 +267,34 @@ def parse_workbook(file) -> pd.DataFrame:
                 col_map[idx] = HEADER_ALIASES[key]
 
         if "Billable Hours" not in col_map.values():
-            continue  # not a data sheet we recognize
+            continue
 
         body = raw.iloc[header_row + 1:].copy()
         body = body.rename(columns=col_map)
         keep_cols = [c for c in body.columns if isinstance(c, str) and c in HEADER_ALIASES.values()]
         body = body[keep_cols]
-
-        # Drop columns that got duplicated (keep first occurrence)
         body = body.loc[:, ~body.columns.duplicated()]
 
-        # Fallback QA name = sheet name if column missing/blank
         if "QA Name" not in body.columns:
             body["QA Name"] = sheet
         body["QA Name"] = body["QA Name"].fillna(sheet)
         body.loc[body["QA Name"].astype(str).str.strip() == "", "QA Name"] = sheet
 
-        # Parse date
         if "Date" in body.columns:
             body["Date"] = pd.to_datetime(body["Date"], errors="coerce")
         else:
             body["Date"] = pd.NaT
 
-        # Drop rows with no date (blank separator rows / "Total" rows / notes)
         body = body[body["Date"].notna()]
         if body.empty:
             continue
 
-        # Numeric columns
         for c in ["Billable Hours", "Non-Billable Hours", "Hours Not Worked", "Total Hours"]:
             if c in body.columns:
                 body[c] = body[c].apply(_to_number)
             else:
                 body[c] = np.nan
 
-        # Drop weekend / off rows where all hour fields are NaN (Sat/Sun placeholders)
         hour_cols = ["Billable Hours", "Non-Billable Hours", "Hours Not Worked", "Total Hours"]
         body = body[~body[hour_cols].isna().all(axis=1)]
         if body.empty:
@@ -279,7 +302,6 @@ def parse_workbook(file) -> pd.DataFrame:
 
         body[hour_cols] = body[hour_cols].fillna(0.0)
 
-        # Recompute Total Hours if inconsistent or missing/zero but components exist
         computed_total = body["Billable Hours"] + body["Non-Billable Hours"] + body["Hours Not Worked"]
         body["Total Hours"] = np.where(
             (body["Total Hours"] <= 0) | (body["Total Hours"].isna()),
@@ -287,30 +309,37 @@ def parse_workbook(file) -> pd.DataFrame:
             body["Total Hours"],
         )
 
-        # Day / Month derived from Date if not present or blank
         body["Day"] = body["Date"].dt.day_name().str.slice(0, 3)
         body["Month"] = body["Date"].dt.strftime("%b")
         body["Year"] = body["Date"].dt.year
 
+        if "Comment" in body.columns:
+            body["Comment"] = body["Comment"].fillna("").astype(str).str.strip()
+        else:
+            body["Comment"] = ""
+
         body["QA Name"] = body["QA Name"].astype(str).str.strip()
-        # Normalize inconsistent name variants (e.g. "Saujanya.Gouda" vs "Saujanya Gouda")
         body["QA Name"] = body["QA Name"].str.replace(r"[._]+", " ", regex=True)
         body["QA Name"] = body["QA Name"].str.replace(r"\s+", " ", regex=True).str.strip()
         body["QA Name"] = body["QA Name"].str.title()
 
         final = body[["QA Name", "Date", "Day", "Month", "Year",
                       "Billable Hours", "Non-Billable Hours",
-                      "Hours Not Worked", "Total Hours"]].copy()
+                      "Hours Not Worked", "Total Hours", "Comment"]].copy()
         final = final[final["QA Name"] != ""]
         frames.append(final)
 
     if not frames:
         return pd.DataFrame(columns=["QA Name", "Date", "Day", "Month", "Year",
                                       "Billable Hours", "Non-Billable Hours",
-                                      "Hours Not Worked", "Total Hours"])
+                                      "Hours Not Worked", "Total Hours", "Comment"])
 
     out = pd.concat(frames, ignore_index=True)
     out = out.drop_duplicates(subset=["QA Name", "Date"], keep="first")
+
+    # Hard rule: never show data beyond today, even if the workbook has it.
+    out = out[out["Date"] <= TODAY]
+
     out = out.sort_values(["QA Name", "Date"]).reset_index(drop=True)
     return out
 
@@ -318,6 +347,10 @@ def parse_workbook(file) -> pd.DataFrame:
 # ============================================================================
 # CHART BUILDERS
 # ============================================================================
+
+def qa_color_map(qa_names):
+    return {name: QA_PALETTE[i % len(QA_PALETTE)] for i, name in enumerate(sorted(qa_names))}
+
 
 def donut_chart(billable, nonbill, notworked, title="Overall Hours Split"):
     labels = ["Billable", "Non-Billable", "Not Worked"]
@@ -333,77 +366,63 @@ def donut_chart(billable, nonbill, notworked, title="Overall Hours Split"):
     total = billable + nonbill + notworked
     util = (billable / total * 100) if total else 0
     fig.update_layout(
-        title=dict(text=title, font=dict(size=16, color="#1F2340"), x=0.0, xanchor="left"),
-        annotations=[dict(text=f"<b>{util:.0f}%</b><br><span style='font-size:11px;color:#6B7280'>Utilization</span>",
-                           x=0.5, y=0.5, showarrow=False, font=dict(size=22, color="#1F2340"))],
+        title=dict(text=title, font=dict(size=15, color=TEXT_MAIN), x=0.0, xanchor="left"),
+        annotations=[dict(text=f"<b>{util:.0f}%</b><br><span style='font-size:11px;color:#7A7F91'>Utilization</span>",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=20, color=TEXT_MAIN))],
         showlegend=True,
-        legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="center", x=0.5),
-        margin=dict(t=50, b=60, l=10, r=10),
+        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
+        margin=dict(t=50, b=55, l=10, r=10),
         height=360,
         paper_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
 
-def bar_chart_by_qa(df_period, title="Billable vs Non-Billable vs Not Worked (per QA)"):
-    grp = df_period.groupby("QA Name")[["Billable Hours", "Non-Billable Hours", "Hours Not Worked"]].sum().reset_index()
-    grp = grp.sort_values("Billable Hours", ascending=True)
+def bar_chart_by_qa(df_period, title="QA Comparison — Total Hours"):
+    grp = df_period.groupby("QA Name")["Total Hours"].sum().reset_index()
+    grp = grp.sort_values("Total Hours", ascending=True)
+    colors = qa_color_map(grp["QA Name"].unique())
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(y=grp["QA Name"], x=grp["Billable Hours"], name="Billable",
-                          orientation="h", marker_color=BILLABLE_COLOR,
-                          hovertemplate="Billable: %{x:.1f} hrs<extra></extra>"))
-    fig.add_trace(go.Bar(y=grp["QA Name"], x=grp["Non-Billable Hours"], name="Non-Billable",
-                          orientation="h", marker_color=NONBILL_COLOR,
-                          hovertemplate="Non-Billable: %{x:.1f} hrs<extra></extra>"))
-    fig.add_trace(go.Bar(y=grp["QA Name"], x=grp["Hours Not Worked"], name="Not Worked",
-                          orientation="h", marker_color=NOTWORKED_COLOR,
-                          hovertemplate="Not Worked: %{x:.1f} hrs<extra></extra>"))
+    fig.add_trace(go.Bar(
+        y=grp["QA Name"], x=grp["Total Hours"], orientation="h",
+        marker_color=[colors[n] for n in grp["QA Name"]],
+        text=[f"{v:,.1f}" for v in grp["Total Hours"]],
+        textposition="outside",
+        hovertemplate="%{y}: %{x:.1f} hrs<extra></extra>",
+    ))
     fig.update_layout(
-        barmode="stack",
-        title=dict(text=title, font=dict(size=16, color="#1F2340"), x=0.0, xanchor="left", y=0.98, yanchor="top"),
-        xaxis=dict(title="Hours", gridcolor="#EEF0FA"),
+        title=dict(text=title, font=dict(size=15, color=TEXT_MAIN), x=0.0, xanchor="left"),
+        xaxis=dict(title="Hours", gridcolor="#F0F1F5"),
         yaxis=dict(title=""),
-        legend=dict(orientation="h", yanchor="bottom", y=1.14, xanchor="center", x=0.5),
-        margin=dict(t=95, b=40, l=10, r=10),
-        height=max(360, 42 * len(grp) + 140),
+        showlegend=False,
+        margin=dict(t=50, b=20, l=10, r=40),
+        height=max(320, 42 * len(grp) + 90),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
 
-def trend_column_chart(df_period, granularity, title="Total Hours Trend"):
-    d = df_period.copy()
-    if granularity == "Daily":
-        d["bucket"] = d["Date"].dt.strftime("%d %b")
-        order_key = d["Date"]
-    elif granularity == "Monthly":
-        d["bucket"] = d["Date"].dt.strftime("%b %Y")
-        order_key = d["Date"]
-    else:  # Yearly
-        d["bucket"] = d["Date"].dt.year.astype(str)
-        order_key = d["Date"]
-
-    grp = d.groupby("bucket").agg(
-        Billable=("Billable Hours", "sum"),
-        NonBillable=("Non-Billable Hours", "sum"),
-        NotWorked=("Hours Not Worked", "sum"),
-        order=("Date", "min"),
-    ).reset_index().sort_values("order")
+def hours_mix_chart(df_period, title="Hours Mix — Billable / Non-Billable / Not Worked"):
+    grp = df_period.groupby("QA Name")[["Billable Hours", "Non-Billable Hours", "Hours Not Worked"]].sum().reset_index()
+    grp = grp.sort_values("Billable Hours", ascending=False)
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=grp["bucket"], y=grp["Billable"], name="Billable", marker_color=BILLABLE_COLOR))
-    fig.add_trace(go.Bar(x=grp["bucket"], y=grp["NonBillable"], name="Non-Billable", marker_color=NONBILL_COLOR))
-    fig.add_trace(go.Bar(x=grp["bucket"], y=grp["NotWorked"], name="Not Worked", marker_color=NOTWORKED_COLOR))
+    fig.add_trace(go.Bar(x=grp["QA Name"], y=grp["Billable Hours"], name="Billable", marker_color=BILLABLE_COLOR,
+                          hovertemplate="Billable: %{y:.1f} hrs<extra></extra>"))
+    fig.add_trace(go.Bar(x=grp["QA Name"], y=grp["Non-Billable Hours"], name="Non-Billable", marker_color=NONBILL_COLOR,
+                          hovertemplate="Non-Billable: %{y:.1f} hrs<extra></extra>"))
+    fig.add_trace(go.Bar(x=grp["QA Name"], y=grp["Hours Not Worked"], name="Not Worked", marker_color=NOTWORKED_COLOR,
+                          hovertemplate="Not Worked: %{y:.1f} hrs<extra></extra>"))
     fig.update_layout(
         barmode="stack",
-        title=dict(text=title, font=dict(size=16, color="#1F2340"), x=0.0, xanchor="left", y=0.98, yanchor="top"),
-        xaxis=dict(title="", gridcolor="#EEF0FA"),
-        yaxis=dict(title="Hours", gridcolor="#EEF0FA"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.16, xanchor="center", x=0.5),
-        margin=dict(t=95, b=40, l=10, r=10),
-        height=400,
+        title=dict(text=title, font=dict(size=15, color=TEXT_MAIN), x=0.0, xanchor="left"),
+        xaxis=dict(title="", gridcolor="#F0F1F5"),
+        yaxis=dict(title="Hours", gridcolor="#F0F1F5"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5),
+        margin=dict(t=50, b=10, l=10, r=10),
+        height=420,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
@@ -423,7 +442,7 @@ def qa_mini_donut(row, qa_name):
     util = (b / total * 100) if total else 0
     fig.update_layout(
         annotations=[dict(text=f"<b>{util:.0f}%</b>", x=0.5, y=0.5, showarrow=False,
-                           font=dict(size=16, color="#1F2340"))],
+                           font=dict(size=16, color=TEXT_MAIN))],
         showlegend=False, margin=dict(t=0, b=0, l=0, r=0), height=140,
         paper_bgcolor="rgba(0,0,0,0)",
     )
@@ -431,11 +450,10 @@ def qa_mini_donut(row, qa_name):
 
 
 # ============================================================================
-# EXPORT HELPERS
+# EXPORT HELPERS  (only ever called after the user clicks "Prepare Export")
 # ============================================================================
 
 def _fig_to_png_bytes(fig, width=900, height=500, scale=2):
-    """Render a Plotly figure to PNG bytes (requires kaleido)."""
     try:
         return fig.to_image(format="png", width=width, height=height, scale=scale)
     except Exception:
@@ -443,32 +461,27 @@ def _fig_to_png_bytes(fig, width=900, height=500, scale=2):
 
 
 def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_figs):
-    """Build an Excel workbook that mirrors the on-screen dashboard:
-    a Dashboard sheet with the KPI numbers + every chart as an embedded image,
-    plus the raw Summary and Detail Data sheets for further analysis.
-    Expects PRE-RENDERED (label, png_bytes) pairs for speed."""
     from openpyxl import Workbook
     from openpyxl.drawing.image import Image as XLImage
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
 
     buf = io.BytesIO()
     wb = Workbook()
 
-    # ---- Dashboard sheet ----
     ws = wb.active
     ws.title = "Dashboard"
     ws.sheet_view.showGridLines = False
 
-    header_fill = PatternFill(start_color="5B5FEF", end_color="5B5FEF", fill_type="solid")
-    title_font = Font(size=16, bold=True, color="1F2340")
-    kpi_label_font = Font(size=10, bold=True, color="6B7280")
-    kpi_val_font = Font(size=18, bold=True, color="1F2340")
+    header_fill = PatternFill(start_color="0F1729", end_color="0F1729", fill_type="solid")
+    title_font = Font(size=16, bold=True, color="0F1729")
+    kpi_label_font = Font(size=10, bold=True, color="7A7F91")
+    kpi_val_font = Font(size=18, bold=True, color="0F1729")
 
-    ws["B2"] = "QA Work Hours Analytics Dashboard"
+    ws["B2"] = "QA Work Hours Dashboard"
     ws["B2"].font = title_font
     ws["B3"] = f"Period: {period_label}   |   Generated: {datetime.now().strftime('%d %b %Y, %H:%M')}"
-    ws["B3"].font = Font(size=10, color="6B7280")
+    ws["B3"].font = Font(size=10, color="7A7F91")
 
     kpi_cells = [
         ("QA TEAM SIZE", f'{kpis["team_size"]}'),
@@ -477,9 +490,8 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
         ("UTILIZATION", f'{kpis["utilization"]:.1f}%'),
         ("TOTAL HOURS", f'{kpis["total"]:.1f}'),
     ]
-    col_start = 2  # column B
     for i, (label, val) in enumerate(kpi_cells):
-        col = get_column_letter(col_start + i * 2)
+        col = get_column_letter(2 + i * 2)
         ws[f"{col}5"] = label
         ws[f"{col}5"].font = kpi_label_font
         ws[f"{col}6"] = val
@@ -488,7 +500,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
     row_cursor = 9
     for title, fig in chart_figs:
         ws[f"B{row_cursor}"] = title
-        ws[f"B{row_cursor}"].font = Font(size=12, bold=True, color="1F2340")
+        ws[f"B{row_cursor}"].font = Font(size=12, bold=True, color="0F1729")
         row_cursor += 1
         png = _fig_to_png_bytes(fig, width=900, height=500)
         if png:
@@ -499,9 +511,8 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
         else:
             row_cursor += 2
 
-    # Per-QA mini donuts, 4 per row
     ws[f"B{row_cursor}"] = "Individual QA Breakdown"
-    ws[f"B{row_cursor}"].font = Font(size=13, bold=True, color="1F2340")
+    ws[f"B{row_cursor}"].font = Font(size=13, bold=True, color="0F1729")
     row_cursor += 2
     col_positions = ["B", "F", "J", "N"]
     start_row = row_cursor
@@ -509,7 +520,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
         col = col_positions[idx % 4]
         r = start_row + (idx // 4) * 14
         ws[f"{col}{r}"] = qa_name
-        ws[f"{col}{r}"].font = Font(size=11, bold=True, color="1F2340")
+        ws[f"{col}{r}"].font = Font(size=11, bold=True, color="0F1729")
         png = _fig_to_png_bytes(fig, width=350, height=350)
         if png:
             img = XLImage(io.BytesIO(png))
@@ -518,7 +529,6 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
 
     ws.column_dimensions["A"].width = 2
 
-    # ---- Data sheets ----
     ws_summary = wb.create_sheet("QA Summary")
     ws_summary.append(list(summary_df.columns))
     for cell in ws_summary[1]:
@@ -536,9 +546,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
     for row in detail_df.itertuples(index=False):
-        row = list(row)
-        # format Date nicely
-        ws_detail.append(row)
+        ws_detail.append(list(row))
     for col_cells in ws_detail.columns:
         length = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
         ws_detail.column_dimensions[col_cells[0].column_letter].width = max(12, min(length + 2, 30))
@@ -549,9 +557,6 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
 
 
 def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
-    """Build a PDF that visually mirrors the dashboard: KPI cards, then every
-    team chart as an image, then a grid of per-QA mini donut cards, then the
-    summary table. Expects PRE-RENDERED (label, png_bytes) pairs for speed."""
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
@@ -565,11 +570,11 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
                              leftMargin=14 * mm, rightMargin=14 * mm)
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("Title2", parent=styles["Title"], fontSize=18,
-                                  textColor=rl_colors.HexColor("#1F2340"))
+                                  textColor=rl_colors.HexColor("#0F1729"))
     sub_style = ParagraphStyle("Sub", parent=styles["Normal"], fontSize=10,
-                                textColor=rl_colors.HexColor("#6B7280"))
+                                textColor=rl_colors.HexColor("#7A7F91"))
     h2_style = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13,
-                               textColor=rl_colors.HexColor("#1F2340"), spaceBefore=6, spaceAfter=6)
+                               textColor=rl_colors.HexColor("#0F1729"), spaceBefore=6, spaceAfter=6)
 
     elements = [
         Paragraph("QA Work Hours Dashboard Report", title_style),
@@ -582,20 +587,19 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
                  f'{kpis["utilization"]:.1f}%', f'{kpis["total"]:.1f}']]
     kpi_table = Table(kpi_data, colWidths=[150] * 5)
     kpi_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#5B5FEF")),
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
         ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
         ("TOPPADDING", (0, 0), (-1, 0), 8),
-        ("BACKGROUND", (0, 1), (-1, 1), rl_colors.HexColor("#F7F8FC")),
-        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#ECEDF7")),
+        ("BACKGROUND", (0, 1), (-1, 1), rl_colors.HexColor("#F4F5F8")),
+        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#E7E9F0")),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
     ]))
     elements.append(kpi_table)
     elements.append(Spacer(1, 14))
 
-    # Team charts, two per row (already rendered upstream)
     chart_imgs = []
     for title, fig in chart_figs:
         png = _fig_to_png_bytes(fig, width=800, height=460)
@@ -606,7 +610,7 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
     row_imgs = []
     for i, (title, png) in enumerate(chart_imgs):
         img = RLImage(io.BytesIO(png), width=370, height=213)
-        cell = [Paragraph(title, ParagraphStyle("ct", fontSize=9, textColor=rl_colors.HexColor("#1F2340"))), img]
+        cell = [Paragraph(title, ParagraphStyle("ct", fontSize=9, textColor=rl_colors.HexColor("#0F1729"))), img]
         row_imgs.append(cell)
         if len(row_imgs) == 2:
             t = Table([row_imgs], colWidths=[390, 390])
@@ -620,15 +624,13 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
         elements.append(t)
 
     elements.append(PageBreak())
-
-    # Per-QA mini donuts grid
     elements.append(Paragraph("Individual QA Breakdown", h2_style))
     mini_row = []
     for i, (qa_name, fig) in enumerate(qa_mini_figs):
         png = _fig_to_png_bytes(fig, width=260, height=260)
         img = RLImage(io.BytesIO(png), width=110, height=110) if png else Paragraph("", styles["Normal"])
         cell = [Paragraph(f"<b>{qa_name}</b>", ParagraphStyle("qn", fontSize=9,
-                           textColor=rl_colors.HexColor("#1F2340"), alignment=1)), img]
+                           textColor=rl_colors.HexColor("#0F1729"), alignment=1)), img]
         mini_row.append(cell)
         if len(mini_row) == 5:
             t = Table([mini_row], colWidths=[156] * 5)
@@ -650,12 +652,12 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
     col_width = 780 / n_cols
     tbl = Table(table_data, colWidths=[col_width] * n_cols, repeatRows=1)
     tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1F2340")),
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
         ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#ECEDF7")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F7F8FC")]),
+        ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
@@ -668,23 +670,27 @@ def to_pdf_bytes(summary_df, kpis, period_label, chart_figs, qa_mini_figs):
 
 
 # ============================================================================
-# APP HEADER
+# APP HEADER / UPLOAD
 # ============================================================================
 
-st.markdown('<div class="app-title">\U0001F4CA QA Work Hours Analytics Dashboard</div>', unsafe_allow_html=True)
-st.markdown('<div class="app-subtitle">Upload the QA hours tracker workbook to get an instant, management-ready view of team utilization.</div>', unsafe_allow_html=True)
+st.markdown("""
+<div class="top-banner">
+    <div class="eyebrow">QA MANAGEMENT SYSTEM &middot; V2</div>
+    <div class="title">QA Hours Dashboard</div>
+</div>
+""", unsafe_allow_html=True)
 
 uploaded = st.file_uploader("Upload QA Work Hours Excel file (.xlsx)", type=["xlsx"])
 
 if uploaded is None:
-    st.info("\U0001F446 Upload your QA hours tracker workbook to begin. Each QA's own sheet will be detected and combined automatically.")
+    st.info("\U0001F446 Upload your QA hours tracker workbook to begin. Each QA's own sheet is detected and combined automatically. Only data up to today's date will ever be shown.")
     st.stop()
 
 with st.spinner("Reading and analyzing the workbook..."):
     data = parse_workbook(uploaded)
 
 if data.empty:
-    st.error("Couldn't find any recognizable QA hour records in this workbook. Please check the sheet format.")
+    st.error("Couldn't find any recognizable QA hour records in this workbook (or all rows were in the future). Please check the sheet format.")
     st.stop()
 
 # ============================================================================
@@ -692,61 +698,107 @@ if data.empty:
 # ============================================================================
 st.sidebar.header("\U0001F50D Filters")
 
-view_mode = st.sidebar.radio("View by", ["Daily", "Monthly", "Yearly"], index=1)
+view_mode = st.sidebar.radio("View by", ["Daily", "Weekly", "Monthly", "Yearly"], index=2)
 
+# ---- QA selection: a real closed dropdown (multiselect), with quick All/None ----
+all_qas = sorted(data["QA Name"].unique().tolist())
+
+if "qa_multiselect" not in st.session_state:
+    st.session_state.qa_multiselect = all_qas.copy()
+# keep state in sync if a new file introduces different QAs
+st.session_state.qa_multiselect = [qa for qa in st.session_state.qa_multiselect if qa in all_qas]
+
+cA, cB = st.sidebar.columns(2)
+if cA.button("Select All QAs", use_container_width=True):
+    st.session_state.qa_multiselect = all_qas.copy()
+if cB.button("Clear QAs", use_container_width=True):
+    st.session_state.qa_multiselect = []
+
+sel_qas = st.sidebar.multiselect("QA Team Members", all_qas, key="qa_multiselect")
+
+st.sidebar.markdown("---")
+
+# ---- Time period selection depending on view mode ----
 years_available = sorted(data["Year"].dropna().unique().astype(int).tolist())
-sel_year = st.sidebar.selectbox("Year", years_available, index=len(years_available) - 1)
 
-df_y = data[data["Year"] == sel_year]
+if view_mode == "Yearly":
+    sel_years = st.sidebar.multiselect("Years", years_available, default=years_available)
+    df_period = data[data["Year"].isin(sel_years)]
+    period_label = ", ".join(str(y) for y in sel_years) if sel_years else "No years selected"
 
-if view_mode == "Monthly":
-    months_available = [m for m in MONTH_ORDER if m in df_y["Month"].unique()]
-    sel_month = st.sidebar.selectbox("Month", months_available, index=len(months_available) - 1 if months_available else 0)
-    df_period = df_y[df_y["Month"] == sel_month]
-    period_label = f"{sel_month} {sel_year}"
-elif view_mode == "Daily":
-    dates_available = sorted(df_y["Date"].dt.date.unique().tolist())
-    if dates_available:
-        sel_date = st.sidebar.selectbox("Date", dates_available, index=len(dates_available) - 1)
-        df_period = df_y[df_y["Date"].dt.date == sel_date]
-        period_label = sel_date.strftime("%d %b %Y")
+elif view_mode == "Monthly":
+    sel_years = st.sidebar.multiselect("Years", years_available, default=years_available)
+    months_in_scope = [m for m in MONTH_ORDER if m in data[data["Year"].isin(sel_years)]["Month"].unique()]
+    sel_months = st.sidebar.multiselect("Months", months_in_scope, default=months_in_scope)
+    df_period = data[data["Year"].isin(sel_years) & data["Month"].isin(sel_months)]
+    period_label = f"{', '.join(sel_months) if sel_months else 'No months'} ({', '.join(str(y) for y in sel_years)})"
+
+elif view_mode == "Weekly":
+    sel_years = st.sidebar.multiselect("Years", years_available, default=years_available)
+    df_y = data[data["Year"].isin(sel_years)]
+    df_y = df_y.assign(_week=df_y["Date"].dt.to_period("W"))
+    week_options = sorted(df_y["_week"].unique())
+    week_labels = {w: f"{w.start_time.strftime('%d %b')} – {w.end_time.strftime('%d %b %Y')}" for w in week_options}
+    sel_weeks = st.sidebar.multiselect(
+        "Weeks", week_options, default=week_options,
+        format_func=lambda w: week_labels.get(w, str(w)),
+    )
+    df_period = df_y[df_y["_week"].isin(sel_weeks)].drop(columns="_week")
+    period_label = f"{len(sel_weeks)} week(s) selected" if sel_weeks else "No weeks selected"
+
+else:  # Daily -> calendar-style multi-date picker
+    min_d, max_d = data["Date"].min().date(), min(data["Date"].max().date(), TODAY.date())
+    sel_dates = st.sidebar.date_input(
+        "Select date(s)", value=(min_d, max_d), min_value=min_d, max_value=max_d,
+    )
+    if isinstance(sel_dates, (tuple, list)) and len(sel_dates) == 2:
+        d_start, d_end = sel_dates
+        df_period = data[(data["Date"].dt.date >= d_start) & (data["Date"].dt.date <= d_end)]
+        period_label = f"{d_start.strftime('%d %b %Y')} – {d_end.strftime('%d %b %Y')}"
+    elif isinstance(sel_dates, (tuple, list)) and len(sel_dates) == 1:
+        d_only = sel_dates[0]
+        df_period = data[data["Date"].dt.date == d_only]
+        period_label = d_only.strftime("%d %b %Y")
     else:
-        df_period = df_y
-        period_label = f"{sel_year}"
-else:  # Yearly
-    df_period = df_y
-    period_label = f"{sel_year}"
+        df_period = data[data["Date"].dt.date == sel_dates]
+        period_label = sel_dates.strftime("%d %b %Y")
 
-qa_list = sorted(df_period["QA Name"].unique().tolist())
-sel_qas = st.sidebar.multiselect("QA Team Members", qa_list, default=qa_list)
 df_period = df_period[df_period["QA Name"].isin(sel_qas)]
 
 if df_period.empty:
-    st.warning("No data for the selected filters.")
+    st.warning("No data for the selected filters. Adjust the QA / time filters in the sidebar.")
     st.stop()
+
+qa_colors = qa_color_map(all_qas)
 
 # ============================================================================
 # KPI SUMMARY
 # ============================================================================
-team_size = df_period["QA Name"].nunique()
+# "QA Team Size" reflects how many QAs are CHECKED in the filter — not just
+# how many happen to have logged rows within the current date/month/year
+# window (a QA with zero hours in a narrow window should still count as
+# selected, matching what the sidebar shows).
+team_size = len(sel_qas)
 billable_total = df_period["Billable Hours"].sum()
 nonbill_total = df_period["Non-Billable Hours"].sum()
 notworked_total = df_period["Hours Not Worked"].sum()
 total_hours = df_period["Total Hours"].sum()
 utilization = (billable_total / total_hours * 100) if total_hours > 0 else 0
+days_logged = df_period["Date"].nunique()
+avg_hours_per_day = (total_hours / (df_period.groupby("QA Name")["Date"].nunique().sum())) if len(df_period) else 0
 
 kpis = dict(team_size=team_size, billable=billable_total, nonbill=nonbill_total,
             utilization=utilization, total=total_hours)
 
-st.markdown(f'<div class="section-header">Summary &nbsp;·&nbsp; {period_label}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="panel-title" style="margin-bottom:12px;">Summary &nbsp;·&nbsp; {period_label}</div>', unsafe_allow_html=True)
 
 k1, k2, k3, k4, k5 = st.columns(5)
 kpi_cells = [
-    (k1, "QA Team Size", f"{team_size}", "active members"),
-    (k2, "Billable Hours", f"{billable_total:,.1f}", "hrs logged"),
-    (k3, "Non-Billable Hours", f"{nonbill_total:,.1f}", "hrs logged"),
-    (k4, "Utilization", f"{utilization:.1f}%", "billable / total"),
-    (k5, "Total Hours", f"{total_hours:,.1f}", "hrs tracked"),
+    (k1, "QA TEAM SIZE", f"{team_size}", "active members"),
+    (k2, "TOTAL HOURS", f"{total_hours:,.1f}", f"across {days_logged} days"),
+    (k3, "BILLABLE SHARE", f"{utilization:.1f}%", f"{billable_total:,.0f} of {total_hours:,.0f} hrs"),
+    (k4, "AVG HOURS / DAY", f"{avg_hours_per_day:.2f}", "per active QA-day"),
+    (k5, "NON-BILLABLE HOURS", f"{nonbill_total:,.1f}", "hrs logged"),
 ]
 for col, label, val, sub in kpi_cells:
     with col:
@@ -761,33 +813,34 @@ for col, label, val, sub in kpi_cells:
 # ============================================================================
 # CHARTS - TEAM LEVEL
 # ============================================================================
-st.markdown('<div class="section-header">Team Overview</div>', unsafe_allow_html=True)
 
-# Build every team chart once, so the same figure objects power both the
-# on-screen dashboard and the Excel/PDF exports (what you see is what you get).
 fig_donut = donut_chart(billable_total, nonbill_total, notworked_total)
 fig_bar = bar_chart_by_qa(df_period)
-fig_trend = trend_column_chart(df_period, view_mode)
+fig_mix = hours_mix_chart(df_period)
 
-# Donut centered in the middle column of a 3-column row
+with st.container(border=True):
+    st.plotly_chart(fig_bar, use_container_width=True, config=PLOTLY_CONFIG)
+
+with st.container(border=True):
+    st.plotly_chart(fig_mix, use_container_width=True, config=PLOTLY_CONFIG)
+
+# Donut, centered
 d1, d2, d3 = st.columns([1, 2, 1])
 with d2:
-    st.plotly_chart(fig_donut, use_container_width=True, config=PLOTLY_CONFIG)
-
-# Bar and Trend charts go full width, stacked
-st.plotly_chart(fig_bar, use_container_width=True, config=PLOTLY_CONFIG)
-st.plotly_chart(fig_trend, use_container_width=True, config=PLOTLY_CONFIG)
+    with st.container(border=True):
+        st.plotly_chart(fig_donut, use_container_width=True, config=PLOTLY_CONFIG)
 
 team_chart_figs = [
+    ("QA Comparison — Total Hours", fig_bar),
+    ("Hours Mix", fig_mix),
     ("Overall Hours Split (Donut)", fig_donut),
-    ("Billable vs Non-Billable vs Not Worked (Bar)", fig_bar),
-    ("Total Hours Trend", fig_trend),
 ]
 
 # ============================================================================
 # PER-QA CARDS
 # ============================================================================
-st.markdown('<div class="section-header">Individual QA Breakdown</div>', unsafe_allow_html=True)
+st.markdown('<div class="panel-title">Individual QA Breakdown</div>', unsafe_allow_html=True)
+st.write("")
 
 qa_summary = df_period.groupby("QA Name").agg(
     **{
@@ -808,21 +861,14 @@ qa_summary = qa_summary.sort_values("Utilization %", ascending=False)
 n_cols = 3
 qa_rows = [qa_summary.iloc[i:i + n_cols] for i in range(0, len(qa_summary), n_cols)]
 
-qa_mini_figs = []  # collected for export reuse
+qa_mini_figs = []
 for chunk in qa_rows:
     cols = st.columns(n_cols)
     for col, (_, row) in zip(cols, chunk.iterrows()):
         with col:
-            util = row["Utilization %"]
-            if util >= 70:
-                badge = '<span class="badge badge-good">Good</span>'
-            elif util >= 40:
-                badge = '<span class="badge badge-warn">Watch</span>'
-            else:
-                badge = '<span class="badge badge-bad">Low</span>'
             st.markdown(f"""
             <div class="qa-card">
-                <div class="qa-name">{row['QA Name']} {badge}</div>
+                <div class="qa-name">{row['QA Name']}</div>
                 <div class="kpi-sub">Days logged: {int(row['Days Logged'])} &nbsp;|&nbsp; Total: {row['Total Hours']:.1f} hrs</div>
             </div>
             """, unsafe_allow_html=True)
@@ -832,60 +878,70 @@ for chunk in qa_rows:
             qa_mini_figs.append((row["QA Name"], mini_fig))
 
 # ============================================================================
-# DETAIL TABLE
+# DAILY LOG TABLE
 # ============================================================================
-with st.expander("\U0001F4CB View Detailed QA Summary Table"):
+st.markdown('<div class="panel-title" style="margin-top:1.2rem;">Daily Log</div>', unsafe_allow_html=True)
+st.caption("Every cleaned daily record for the QAs and period selected in the sidebar filters · sortable")
+
+log_df = df_period.copy()
+
+log_df_display = log_df[["Date", "Day", "QA Name", "Billable Hours", "Non-Billable Hours",
+                          "Hours Not Worked", "Total Hours", "Comment"]].sort_values("Date", ascending=False)
+log_df_display["Date"] = log_df_display["Date"].dt.strftime("%Y-%m-%d")
+
+st.dataframe(log_df_display.round(2), use_container_width=True, hide_index=True, height=380)
+st.caption(f"{len(log_df_display):,} rows")
+
+with st.expander("\U0001F4CB View Per-QA Summary Table"):
     st.dataframe(
         qa_summary[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked",
                      "Total Hours", "Utilization %", "Days Logged"]].round(1),
         use_container_width=True, hide_index=True,
     )
 
-with st.expander("\U0001F5C2\uFE0F View Raw Daily Records (Selected Period)"):
-    st.dataframe(
-        df_period[["QA Name", "Date", "Day", "Month", "Billable Hours",
-                    "Non-Billable Hours", "Hours Not Worked", "Total Hours"]]
-        .sort_values(["QA Name", "Date"]).round(1),
-        use_container_width=True, hide_index=True,
-    )
-
 # ============================================================================
-# EXPORTS
+# EXPORT — explicit "Prepare Export" gate.
+# Nothing below is computed until the button is pressed, and once the export
+# bytes exist they are cached in session_state so simply changing an unrelated
+# filter afterwards does NOT silently regenerate/re-run the export.
 # ============================================================================
-st.markdown('<div class="section-header">Export</div>', unsafe_allow_html=True)
-e1, e2 = st.columns(2)
+st.markdown('<div class="panel-title" style="margin-top:1.2rem;">Export</div>', unsafe_allow_html=True)
+st.caption("Exports always reflect exactly what is on screen right now. Nothing is generated until you click Prepare Export.")
 
 export_summary = qa_summary[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked",
                               "Total Hours", "Utilization %", "Days Logged"]].round(2)
 export_detail = df_period[["QA Name", "Date", "Day", "Month", "Billable Hours",
-                            "Non-Billable Hours", "Hours Not Worked", "Total Hours"]].sort_values(["QA Name", "Date"])
+                            "Non-Billable Hours", "Hours Not Worked", "Total Hours", "Comment"]].sort_values(["QA Name", "Date"])
 
-with e1:
-    try:
-        with st.spinner("Building Excel report with charts..."):
-            excel_bytes = to_excel_bytes(export_summary, export_detail, kpis, period_label,
-                                          team_chart_figs, qa_mini_figs)
+prepare_clicked = st.button("\u2699\ufe0f Prepare Exports", type="primary", use_container_width=False)
+
+if prepare_clicked:
+    with st.spinner("Building Excel and PDF reports..."):
+        st.session_state["export_excel_bytes"] = to_excel_bytes(
+            export_summary, export_detail, kpis, period_label, team_chart_figs, qa_mini_figs)
+        st.session_state["export_pdf_bytes"] = to_pdf_bytes(
+            export_summary, kpis, period_label, team_chart_figs, qa_mini_figs)
+        st.session_state["export_period_label"] = period_label
+    st.success("Exports ready below \u2014 changing filters now will NOT regenerate them until you click Prepare Exports again.")
+
+if "export_excel_bytes" in st.session_state:
+    e1, e2 = st.columns(2)
+    fname_period = st.session_state.get("export_period_label", period_label).replace(" ", "_").replace(",", "")
+    with e1:
         st.download_button(
-            "\U0001F4E5 Export to Excel",
-            data=excel_bytes,
-            file_name=f"QA_Dashboard_{period_label.replace(' ', '_')}.xlsx",
+            "\U0001F4E5 Download Excel",
+            data=st.session_state["export_excel_bytes"],
+            file_name=f"QA_Dashboard_{fname_period}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-    except Exception as e:
-        st.error(f"Excel export failed: {e}")
-with e2:
-    try:
-        with st.spinner("Building PDF report with charts..."):
-            pdf_bytes = to_pdf_bytes(export_summary, kpis, period_label, team_chart_figs, qa_mini_figs)
+    with e2:
         st.download_button(
-            "\U0001F4C4 Export to PDF",
-            data=pdf_bytes,
-            file_name=f"QA_Dashboard_{period_label.replace(' ', '_')}.pdf",
+            "\U0001F4C4 Download PDF",
+            data=st.session_state["export_pdf_bytes"],
+            file_name=f"QA_Dashboard_{fname_period}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
-    except Exception as e:
-        st.error(f"PDF export unavailable: {e}")
 
 st.caption("Built for QA Management \u00b7 Streamlit Dashboard \u00b7 Ready for desktop packaging (Windows/Mac)")
