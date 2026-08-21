@@ -47,8 +47,13 @@ NONBILL_COLOR = "#E0A72E"      # amber
 NOTWORKED_COLOR = "#C1543D"    # brick red
 ACCENT = "#2F9E8F"
 
-QA_PALETTE = ["#2F9E8F", "#D97A46", "#6E7FC9", "#C1543D",
-              "#8E9257", "#DCB13A", "#4C7A96", "#9C6FA6"]
+
+# Note: intentionally does NOT reuse BILLABLE_COLOR (#2F9E8F) or
+# NOTWORKED_COLOR (#C1543D) — those two hues are reserved for the
+# Billable/Non-Billable/Not-Worked state encoding in the stacked and donut
+# charts, so a QA-identity color here can never be mistaken for that meaning.
+QA_PALETTE = ["#4C6FA6", "#D97A46", "#6E7FC9", "#5B9279",
+              "#8E9257", "#DCB13A", "#A65D8C", "#9C6FA6"]
 
 CUSTOM_CSS = f"""
 <style>
@@ -377,7 +382,18 @@ def qa_color_map(qa_names):
     return {name: QA_PALETTE[i % len(QA_PALETTE)] for i, name in enumerate(sorted(qa_names))}
 
 
-def donut_chart(billable, nonbill, notworked, title="Overall Hours Split"):
+def _teal_scale(t):
+    """Map t in [0, 1] to a hex color on a light-to-dark teal ramp (same
+    family as BILLABLE_COLOR). Used for value-encoded bars where color
+    represents magnitude, not category identity."""
+    t = max(0.0, min(1.0, t))
+    light = (0xD3, 0xEE, 0xEA)   # pale teal
+    dark = (0x17, 0x5E, 0x54)    # deep teal
+    rgb = tuple(int(light[i] + (dark[i] - light[i]) * t) for i in range(3))
+    return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+
+def donut_chart(billable, nonbill, notworked, title="Team Utilization Split"):
     labels = ["Billable", "Non-Billable", "Not Worked"]
     values = [billable, nonbill, notworked]
     colors = [BILLABLE_COLOR, NONBILL_COLOR, NOTWORKED_COLOR]
@@ -404,14 +420,28 @@ def donut_chart(billable, nonbill, notworked, title="Overall Hours Split"):
 
 
 def bar_chart_by_qa(df_period, title="QA Comparison — Total Hours"):
+    # Canonical sort used across the whole app: Total Hours, descending.
+    # Kept as ascending=True here on purpose — Plotly draws horizontal bars
+    # bottom-to-top, so an ascending sort on the underlying data renders the
+    # highest total at the TOP of the chart, i.e. visually descending.
     grp = df_period.groupby("QA Name")["Total Hours"].sum().reset_index()
     grp = grp.sort_values("Total Hours", ascending=True)
-    colors = qa_color_map(grp["QA Name"].unique())
+
+    # Single-hue value scale (teal, matching BILLABLE_COLOR's family) instead
+    # of the categorical QA_PALETTE. Color here doesn't encode QA identity —
+    # it encodes magnitude — so a continuous scale reads more honestly than a
+    # rainbow of unrelated per-person colors. This also keeps the
+    # teal/amber/red trio reserved strictly for Billable/Non-Billable/Not-Worked
+    # in the stacked and donut charts, with no accidental reuse here.
+    max_hours = grp["Total Hours"].max() if len(grp) else 0
+    bar_colors = [
+        _teal_scale(v / max_hours if max_hours else 0) for v in grp["Total Hours"]
+    ]
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=grp["QA Name"], x=grp["Total Hours"], orientation="h",
-        marker_color=[colors[n] for n in grp["QA Name"]],
+        marker_color=bar_colors,
         text=[f"{v:,.1f}" for v in grp["Total Hours"]],
         textposition="outside",
         hovertemplate="%{y}: %{x:.1f} hrs<extra></extra>",
@@ -430,8 +460,13 @@ def bar_chart_by_qa(df_period, title="QA Comparison — Total Hours"):
 
 
 def hours_mix_chart(df_period, title="Hours Mix — Billable / Non-Billable / Not Worked"):
-    grp = df_period.groupby("QA Name")[["Billable Hours", "Non-Billable Hours", "Hours Not Worked"]].sum().reset_index()
-    grp = grp.sort_values("Billable Hours", ascending=False)
+    # Canonical sort: Total Hours, descending — same rule used by the bar
+    # chart, the breakdown cards, and the summary table below.
+    grp = df_period.groupby("QA Name")[
+        ["Billable Hours", "Non-Billable Hours", "Hours Not Worked"]
+    ].sum().reset_index()
+    grp["Total Hours"] = grp["Billable Hours"] + grp["Non-Billable Hours"] + grp["Hours Not Worked"]
+    grp = grp.sort_values("Total Hours", ascending=False)
 
     fig = go.Figure()
     fig.add_trace(go.Bar(x=grp["QA Name"], y=grp["Billable Hours"], name="Billable", marker_color=BILLABLE_COLOR,
@@ -459,16 +494,22 @@ def qa_mini_donut(row, qa_name):
     fig = go.Figure(data=[go.Pie(
         labels=["Billable", "Non-Billable", "Not Worked"], values=[b, n, w], hole=0.65,
         marker=dict(colors=[BILLABLE_COLOR, NONBILL_COLOR, NOTWORKED_COLOR], line=dict(color="white", width=2)),
-        textinfo="none",
-        hovertemplate="%{label}: %{value:.1f} hrs<extra></extra>",
+        # Show each slice's own share as an on-chart label (matching the big
+        # donut's textinfo="percent") so the split is readable at a glance,
+        # not only on hover.
+        textinfo="percent",
+        textposition="inside",
+        textfont=dict(size=10, color="white", family="Arial Black"),
+        hovertemplate="%{label}: %{value:.1f} hrs (%{percent})<extra></extra>",
         sort=False,
     )])
     total = b + n + w
     util = (b / total * 100) if total else 0
     fig.update_layout(
-        annotations=[dict(text=f"<b>{util:.0f}%</b>", x=0.5, y=0.5, showarrow=False,
-                           font=dict(size=16, color=TEXT_MAIN))],
-        showlegend=False, margin=dict(t=0, b=0, l=0, r=0), height=140,
+        annotations=[dict(text=f"<b>{util:.0f}%</b><br><span style='font-size:8px;color:#7A7F91'>Utilization</span>",
+                           x=0.5, y=0.5, showarrow=False,
+                           font=dict(size=15, color=TEXT_MAIN))],
+        showlegend=False, margin=dict(t=0, b=0, l=0, r=0), height=150,
         paper_bgcolor="rgba(0,0,0,0)",
     )
     return fig
@@ -478,14 +519,173 @@ def qa_mini_donut(row, qa_name):
 # EXPORT HELPERS  (only ever called after the user clicks "Prepare Export")
 # ============================================================================
 
-def _fig_to_png_bytes(fig, width=900, height=500, scale=2):
+def _safe_filename_fragment(text, max_len=60):
+    """Strip characters that are unsafe in Windows/Mac filenames (plus
+    parentheses, which are legal but look messy in a filename) and collapse
+    whitespace/commas into underscores, so export filenames never break when
+    downloaded on either OS. Truncates long fragments so the full filename
+    stays reasonable."""
+    text = re.sub(r'[\\/:*?"<>|()]', "", text)
+    text = re.sub(r"[\s,]+", "_", text.strip())
+    text = re.sub(r"_+", "_", text)
+    text = text.strip("_")
+    return text[:max_len] if len(text) > max_len else text
+
+
+def _build_export_filename_base(period_label, sel_qas, all_qas):
+    """Build the shared filename base (without extension) for an export,
+    reflecting both the time period AND the QA selection at the moment
+    "Prepare Exports" was clicked -- so a file filtered to 2 of 8 QAs is
+    identifiable from its filename alone, not just its contents."""
+    period_part = _safe_filename_fragment(period_label)
+
+    if not sel_qas or set(sel_qas) == set(all_qas):
+        # No QA-specific suffix needed: either everyone is included (the
+        # default, most common case) or nothing is (period_label alone,
+        # e.g. "No months selected", already says enough).
+        qa_part = ""
+    elif len(sel_qas) <= 3:
+        # A handful of named QAs: spell them out, it's still a short, readable filename.
+        qa_part = "_" + "_".join(_safe_filename_fragment(q, max_len=20) for q in sorted(sel_qas))
+    else:
+        # Many QAs but not all: naming them all would make the filename
+        # unwieldy, so summarize by count instead.
+        qa_part = f"_{len(sel_qas)}QAs"
+
+    base = f"QA_Dashboard_{period_part}{qa_part}"
+    return base if base else "QA_Dashboard_Export"
+
+
+KALEIDO_PROBE_TIMEOUT_SECONDS = 8   # one-time-per-session viability check (see _check_kaleido_available)
+KALEIDO_TIMEOUT_SECONDS = 10        # per real figure render; called up to ~22 times in one export cycle,
+                                     # so this is a multiplicative cost, not a fixed one -- kept tight but
+                                     # still generous given the render resolutions were also cut ~5x below.
+
+
+def _run_with_timeout(fn, timeout_seconds, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a worker thread and enforce a hard wall-clock
+    timeout. Needed because a broken kaleido install (most commonly: it can't
+    find/launch a Chrome/Chromium runtime) doesn't always raise an exception —
+    it can hang the underlying subprocess call indefinitely instead. A plain
+    try/except never catches a hang, so this is the only reliable guard.
+    Uses a thread (not signal.alarm) so it also works on Windows, since this
+    app is meant to be packaged into a Windows .exe / Mac .dmg later.
+
+    IMPORTANT: uses shutdown(wait=False) — if we let the ThreadPoolExecutor's
+    context manager do its default wait=True shutdown, it blocks until the
+    hung worker thread actually finishes, defeating the entire point of the
+    timeout (the caller would still wait the full hang duration). The
+    abandoned worker thread is left to die in the background (or run out
+    the process's lifetime); Python threads don't get force-killed, but the
+    caller gets control back at the deadline either way, which is what
+    actually matters here."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, *args, **kwargs)
     try:
-        return fig.to_image(format="png", width=width, height=height, scale=scale)
+        result = future.result(timeout=timeout_seconds)
+        pool.shutdown(wait=False)
+        return result
+    except FutureTimeoutError:
+        pool.shutdown(wait=False)
+        raise TimeoutError(
+            f"Chart image rendering did not finish within {timeout_seconds} seconds "
+            "and was abandoned. This almost always means kaleido's headless "
+            "Chrome/Chromium subprocess is hanging or failing to launch in this "
+            "environment, not that your computer is slow."
+        )
     except Exception:
-        return None
+        pool.shutdown(wait=False)
+        raise
 
 
-def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_figs):
+def _check_kaleido_available():
+    """Kaleido (>=1.3.0, see requirements.txt) is required to turn Plotly
+    figures into static images for the Excel/PDF exports. A successful
+    `import kaleido` does NOT guarantee fig.to_image() actually works —
+    kaleido v1 needs a real Chrome/Chromium installation on the machine (it
+    no longer bundles one, unlike the old 0.2.1 that's no longer used here),
+    and if that's missing it raises a clear "Chrome not installed"
+    RuntimeError rather than hanging. This still runs a real, tiny,
+    TIME-LIMITED end-to-end render so a broken install is always caught
+    quickly instead of silently producing blank chart pages.
+
+    Returns (ok: bool, message: str | None, chrome_missing: bool). When
+    chrome_missing is True, the caller can offer a one-click "Install
+    Chrome" button (see the Export section) rather than this function
+    silently starting a ~100MB+ download on its own — a health check
+    shouldn't have a surprise multi-second network side effect."""
+    try:
+        import kaleido  # noqa: F401
+    except ImportError:
+        return False, (
+            "The 'kaleido' package is not installed, so charts cannot be "
+            "rendered into the Excel/PDF exports. Install it with:\n\n"
+            "    pip install kaleido==1.3.0\n\n"
+            "then restart the app and click Prepare Exports again."
+        ), False
+
+    def _probe():
+        probe_fig = go.Figure(data=[go.Bar(x=[1], y=[1])])
+        png_bytes = probe_fig.to_image(format="png", width=100, height=100, scale=1)
+        if not png_bytes or len(png_bytes) < 200 or not png_bytes.startswith(b"\x89PNG"):
+            raise RuntimeError("kaleido produced invalid/empty image data")
+        return png_bytes
+
+    try:
+        _run_with_timeout(_probe, KALEIDO_PROBE_TIMEOUT_SECONDS)
+        return True, None, False
+    except Exception as e:
+        chrome_missing = "chrome" in str(e).lower()
+        if chrome_missing:
+            return False, (
+                "Kaleido needs a real Chrome installation on this machine to "
+                "render charts \u2014 it no longer bundles one (unlike the older "
+                "kaleido 0.2.1). Click **Install Chrome for Exports** below to "
+                "fetch it automatically (~100MB, one-time, takes a minute), or "
+                "install Chrome yourself from google.com/chrome. Either way, "
+                "restart the Streamlit app afterwards and click Prepare "
+                "Exports again."
+            ), True
+        return False, (
+            f"Kaleido failed a quick test export ({e}). Chrome appears to be "
+            "installed, so this is likely a version mismatch \u2014 make sure "
+            "`kaleido` and `plotly` are both current:\n\n"
+            "    pip install --upgrade kaleido plotly\n\n"
+            "(a kaleido older than 1.3.0 paired with a newer plotly is a "
+            "known source of export errors), then fully restart the "
+            "Streamlit app (not just refresh the browser) and click Prepare "
+            "Exports again."
+        ), False
+
+
+
+def _fig_to_png_bytes(fig, width=900, height=500, scale=2):
+    """Render a Plotly figure to PNG bytes, with a hard timeout. Raises on
+    failure, on a timeout, OR on a suspiciously tiny/invalid result (instead
+    of silently returning None, hanging forever, or trusting corrupt bytes)
+    so export problems are always visible, never baked into a broken-looking
+    PDF/Excel file with empty chart slots or an unresponsive UI."""
+    def _render():
+        return fig.to_image(format="png", width=width, height=height, scale=scale)
+
+    png_bytes = _run_with_timeout(_render, KALEIDO_TIMEOUT_SECONDS)
+    if not png_bytes or len(png_bytes) < 500 or not png_bytes.startswith(b"\x89PNG"):
+        raise RuntimeError(
+            "Chart image rendering returned invalid/empty PNG data — "
+            "kaleido may be installed but not working correctly in this "
+            "environment (common cause: missing Chrome/Chromium runtime "
+            "that kaleido depends on)."
+        )
+    return png_bytes
+
+
+def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_pngs, qa_names, mini_pngs, include_images=True):
+    """chart_pngs and mini_pngs are dicts of already-rendered PNG bytes,
+    keyed by chart title / QA name respectively -- rendered once, shared with
+    to_pdf_bytes, rather than re-rendered here from scratch. Pass an empty
+    dict (not None) when include_images is False."""
     from openpyxl import Workbook
     from openpyxl.drawing.image import Image as XLImage
     from openpyxl.styles import Font, PatternFill
@@ -502,6 +702,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
     title_font = Font(size=16, bold=True, color="0F1729")
     kpi_label_font = Font(size=10, bold=True, color="7A7F91")
     kpi_val_font = Font(size=18, bold=True, color="0F1729")
+    note_font = Font(size=9, italic=True, color="C1543D")
 
     ws["B2"] = "QA Work Hours Dashboard"
     ws["B2"].font = title_font
@@ -523,34 +724,45 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
         ws[f"{col}6"].font = kpi_val_font
 
     row_cursor = 9
-    for title, fig in chart_figs:
-        ws[f"B{row_cursor}"] = title
-        ws[f"B{row_cursor}"].font = Font(size=12, bold=True, color="0F1729")
-        row_cursor += 1
-        png = _fig_to_png_bytes(fig, width=900, height=500)
-        if png:
-            img = XLImage(io.BytesIO(png))
-            img.width, img.height = 560, 311
-            ws.add_image(img, f"B{row_cursor}")
-            row_cursor += 20
-        else:
-            row_cursor += 2
+    images_failed = False
+    if include_images:
+        for title in chart_titles:
+            ws[f"B{row_cursor}"] = title
+            ws[f"B{row_cursor}"].font = Font(size=12, bold=True, color="0F1729")
+            row_cursor += 1
+            png = chart_pngs.get(title)
+            if png is not None:
+                img = XLImage(io.BytesIO(png))
+                img.width, img.height = 560, 311
+                ws.add_image(img, f"B{row_cursor}")
+                row_cursor += 20
+            else:
+                images_failed = True
+                ws[f"B{row_cursor}"] = "(chart image unavailable — see chart data in the tables below)"
+                ws[f"B{row_cursor}"].font = note_font
+                row_cursor += 2
 
-    ws[f"B{row_cursor}"] = "Individual QA Breakdown"
-    ws[f"B{row_cursor}"].font = Font(size=13, bold=True, color="0F1729")
-    row_cursor += 2
-    col_positions = ["B", "F", "J", "N"]
-    start_row = row_cursor
-    for idx, (qa_name, fig) in enumerate(qa_mini_figs):
-        col = col_positions[idx % 4]
-        r = start_row + (idx // 4) * 14
-        ws[f"{col}{r}"] = qa_name
-        ws[f"{col}{r}"].font = Font(size=11, bold=True, color="0F1729")
-        png = _fig_to_png_bytes(fig, width=350, height=350)
-        if png:
-            img = XLImage(io.BytesIO(png))
-            img.width, img.height = 220, 220
-            ws.add_image(img, f"{col}{r + 1}")
+        ws[f"B{row_cursor}"] = "Individual QA Breakdown"
+        ws[f"B{row_cursor}"].font = Font(size=13, bold=True, color="0F1729")
+        row_cursor += 2
+        col_positions = ["B", "F", "J", "N"]
+        start_row = row_cursor
+        for idx, qa_name in enumerate(qa_names):
+            col = col_positions[idx % 4]
+            r = start_row + (idx // 4) * 14
+            ws[f"{col}{r}"] = qa_name
+            ws[f"{col}{r}"].font = Font(size=11, bold=True, color="0F1729")
+            png = mini_pngs.get(qa_name)
+            if png is not None:
+                img = XLImage(io.BytesIO(png))
+                img.width, img.height = 220, 220
+                ws.add_image(img, f"{col}{r + 1}")
+            else:
+                images_failed = True
+    else:
+        ws[f"B{row_cursor}"] = "Chart images were skipped for this export (kaleido unavailable). All figures are in the tables below."
+        ws[f"B{row_cursor}"].font = note_font
+        row_cursor += 2
 
     ws.column_dimensions["A"].width = 2
 
@@ -578,15 +790,18 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_min
 
     wb.save(buf)
     buf.seek(0)
-    return buf
+    return buf, images_failed
 
 
-def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_figs):
+def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_pngs, qa_names, mini_pngs, include_images=True):
+    """chart_pngs and mini_pngs are the SAME already-rendered PNG dicts passed
+    to to_excel_bytes -- rendering happens exactly once per figure, shared
+    between both export formats, rather than once per format."""
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
     from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle, Paragraph,
-                                     Spacer, Image as RLImage, PageBreak)
+                                     Spacer, Image as RLImage, PageBreak, KeepTogether)
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
     buf = io.BytesIO()
@@ -625,35 +840,113 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_
     elements.append(kpi_table)
     elements.append(Spacer(1, 14))
 
+    images_failed = False
     chart_imgs = []
-    for title, fig in chart_figs:
-        png = _fig_to_png_bytes(fig, width=800, height=460)
-        if png:
-            chart_imgs.append((title, png))
+    if include_images:
+        for title in chart_titles:
+            png = chart_pngs.get(title)
+            if png is not None:
+                chart_imgs.append((title, png))
+            else:
+                images_failed = True
 
     elements.append(Paragraph("Team Overview", h2_style))
-    row_imgs = []
-    for i, (title, png) in enumerate(chart_imgs):
-        img = RLImage(io.BytesIO(png), width=370, height=213)
-        cell = [Paragraph(title, ParagraphStyle("ct", fontSize=9, textColor=rl_colors.HexColor("#0F1729"))), img]
-        row_imgs.append(cell)
-        if len(row_imgs) == 2:
-            t = Table([row_imgs], colWidths=[390, 390])
+
+    if chart_imgs:
+        # Normal path: charts rendered fine, show them as images.
+        row_imgs = []
+        for i, (title, png) in enumerate(chart_imgs):
+            img = RLImage(io.BytesIO(png), width=370, height=213)
+            cell = [Paragraph(title, ParagraphStyle("ct", fontSize=9, textColor=rl_colors.HexColor("#0F1729"))), img]
+            row_imgs.append(cell)
+            if len(row_imgs) == 2:
+                t = Table([row_imgs], colWidths=[390, 390])
+                t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+                elements.append(t)
+                elements.append(Spacer(1, 8))
+                row_imgs = []
+        if row_imgs:
+            t = Table([row_imgs], colWidths=[390] * len(row_imgs))
             t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
             elements.append(t)
-            elements.append(Spacer(1, 8))
-            row_imgs = []
-    if row_imgs:
-        t = Table([row_imgs], colWidths=[390] * len(row_imgs))
-        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
-        elements.append(t)
+    else:
+        # Fallback path: no images available for any reason (kaleido disabled,
+        # unavailable, or every render failed). Never leave a near-empty page —
+        # show the same information as real numbers instead of an image.
+        elements.append(Paragraph(
+            "Chart images could not be rendered in this environment (kaleido/Chrome "
+            "unavailable). The figures below are the same data the on-screen charts "
+            "show, presented as tables instead.",
+            sub_style))
+        elements.append(Spacer(1, 8))
 
-    elements.append(PageBreak())
+        elements.append(Paragraph("QA Comparison &mdash; Total Hours", ParagraphStyle(
+            "h3a", fontSize=11, textColor=rl_colors.HexColor("#0F1729"), spaceBefore=4, spaceAfter=4)))
+        comp_df = summary_df[["QA Name", "Total Hours"]].sort_values("Total Hours", ascending=False)
+        comp_data = [["QA Name", "Total Hours"]] + comp_df.round(1).astype(str).values.tolist()
+        comp_tbl = Table(comp_data, colWidths=[250, 150])
+        comp_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(comp_tbl)
+        elements.append(Spacer(1, 14))
+
+        elements.append(Paragraph("Hours Mix &mdash; Billable / Non-Billable / Not Worked", ParagraphStyle(
+            "h3b", fontSize=11, textColor=rl_colors.HexColor("#0F1729"), spaceBefore=4, spaceAfter=4)))
+        mix_df = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked"]]
+        mix_data = [["QA Name", "Billable", "Non-Billable", "Not Worked"]] + mix_df.round(1).astype(str).values.tolist()
+        mix_tbl = Table(mix_data, colWidths=[220, 120, 120, 120])
+        mix_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(mix_tbl)
+        elements.append(Spacer(1, 14))
+
+        elements.append(Paragraph("Team Utilization Split", ParagraphStyle(
+            "h3c", fontSize=11, textColor=rl_colors.HexColor("#0F1729"), spaceBefore=4, spaceAfter=4)))
+        elements.append(Paragraph(
+            f"Billable: {kpis['billable']:.1f} hrs &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Non-Billable: {kpis['nonbill']:.1f} hrs &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Utilization: {kpis['utilization']:.1f}%",
+            sub_style))
+
+    # Only force a fresh page here when there are real chart images that need
+    # the room -- confirmed by direct visual inspection that forcing a page
+    # break in the image-less fallback path left 60-85% of the page blank,
+    # since the fallback content (a couple of small tables) is far shorter
+    # than an embedded chart image. Letting ReportLab's natural flow pack
+    # sections together in the fallback case avoids that wasted space.
+    if include_images:
+        elements.append(PageBreak())
     elements.append(Paragraph("Individual QA Breakdown", h2_style))
+
     mini_row = []
-    for i, (qa_name, fig) in enumerate(qa_mini_figs):
-        png = _fig_to_png_bytes(fig, width=260, height=260)
-        img = RLImage(io.BytesIO(png), width=110, height=110) if png else Paragraph("", styles["Normal"])
+    any_mini_image = False
+    for i, qa_name in enumerate(qa_names):
+        img = None
+        if include_images:
+            png = mini_pngs.get(qa_name)
+            if png is not None:
+                img = RLImage(io.BytesIO(png), width=110, height=110)
+                any_mini_image = True
+            else:
+                images_failed = True
+        if img is None:
+            img = Paragraph("", styles["Normal"])
         cell = [Paragraph(f"<b>{qa_name}</b>", ParagraphStyle("qn", fontSize=9,
                            textColor=rl_colors.HexColor("#0F1729"), alignment=1)), img]
         mini_row.append(cell)
@@ -668,15 +961,45 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_
         t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
         elements.append(t)
 
-    elements.append(PageBreak())
-    elements.append(Paragraph("Per-QA Summary Table", h2_style))
-    elements.append(Spacer(1, 4))
+    if not any_mini_image:
+        # No per-QA donut images either — replace the mostly-empty name grid
+        # with the real per-QA utilization numbers instead.
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph(
+            "Donut images could not be rendered in this environment. Per-QA "
+            "utilization (the number the donuts show) is below:",
+            sub_style))
+        elements.append(Spacer(1, 6))
+        util_df = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours",
+                               "Hours Not Worked", "Total Hours", "Utilization %"]]
+        util_data = [["QA Name", "Billable", "Non-Billable", "Not Worked", "Total", "Utilization %"]] + \
+                    util_df.round(1).astype(str).values.tolist()
+        util_tbl = Table(util_data, colWidths=[170, 100, 110, 100, 90, 110])
+        util_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(util_tbl)
 
-    table_data = [list(summary_df.columns)] + summary_df.round(1).astype(str).values.tolist()
+    # Same reasoning as above: only force a page break here if the section
+    # just rendered actually used real images (any_mini_image is more precise
+    # than the general include_images flag, since individual mini-donut
+    # renders can fail even when include_images is True overall).
+    if any_mini_image:
+        elements.append(PageBreak())
+
+    per_qa_table_data = [list(summary_df.columns)] + summary_df.round(1).astype(str).values.tolist()
     n_cols = len(summary_df.columns)
     col_width = 780 / n_cols
-    tbl = Table(table_data, colWidths=[col_width] * n_cols, repeatRows=1)
-    tbl.setStyle(TableStyle([
+    per_qa_tbl = Table(per_qa_table_data, colWidths=[col_width] * n_cols, repeatRows=1)
+    per_qa_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
         ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
@@ -687,10 +1010,20 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    elements.append(tbl)
+    elements.append(KeepTogether([
+        Paragraph("Per-QA Summary Table", h2_style),
+        Spacer(1, 4),
+        per_qa_tbl,
+    ]))
 
     # ---- Daily Log (mirrors the on-screen Daily Log table) ----
-    elements.append(PageBreak())
+    # Same reasoning as the two page breaks above, corrected after actually
+    # rendering and inspecting the output: in the no-images fallback case the
+    # Per-QA Summary Table is short enough to leave real room on its page, so
+    # forcing a break here left that page mostly blank too. Conditional on
+    # include_images lets Daily Log flow naturally in the fallback case.
+    if include_images:
+        elements.append(PageBreak())
     elements.append(Paragraph("Daily Log", h2_style))
     elements.append(Paragraph(
         f"{len(detail_df):,} rows &middot; sorted by date, most recent first",
@@ -734,7 +1067,7 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_figs, qa_mini_
 
     doc.build(elements)
     buf.seek(0)
-    return buf
+    return buf, images_failed
 
 
 # ============================================================================
@@ -766,6 +1099,20 @@ if data.empty:
 # ============================================================================
 st.sidebar.header("\U0001F50D Filters")
 
+# "Clear All" (button lives at the very bottom of the sidebar, see below)
+# has to take effect here, BEFORE any filter widget below is instantiated —
+# Streamlit widgets read their bound session_state key at creation time, so
+# clearing state after the widgets already rendered this run would only be
+# visible on the NEXT interaction, not immediately. The button itself sets
+# this flag and calls st.rerun(); this block is what actually acts on it.
+if st.session_state.get("_clear_all_filters"):
+    st.session_state["_clear_all_filters"] = False
+    st.session_state["qa_multiselect"] = []
+    # Empty each, matching exactly what that filter's own individual Clear
+    # button does — Clear All is just "press every Clear button at once".
+    for _k in ("years_multiselect", "months_multiselect", "weeks_multiselect"):
+        st.session_state[_k] = []
+
 view_mode = st.sidebar.radio("View by", ["Daily", "Weekly", "Monthly", "Yearly"], index=2)
 
 # ---- QA selection: a real closed dropdown (multiselect), with quick All/None ----
@@ -776,10 +1123,7 @@ if "qa_multiselect" not in st.session_state:
 # keep state in sync if a new file introduces different QAs
 st.session_state.qa_multiselect = [qa for qa in st.session_state.qa_multiselect if qa in all_qas]
 
-cA, cB = st.sidebar.columns(2)
-if cA.button("Select All QAs", use_container_width=True):
-    st.session_state.qa_multiselect = all_qas.copy()
-if cB.button("Clear QAs", use_container_width=True):
+if st.sidebar.button("Clear QAs", use_container_width=True):
     st.session_state.qa_multiselect = []
 
 sel_qas = st.sidebar.multiselect("QA Team Members", all_qas, key="qa_multiselect")
@@ -789,30 +1133,73 @@ st.sidebar.markdown("---")
 # ---- Time period selection depending on view mode ----
 years_available = sorted(data["Year"].dropna().unique().astype(int).tolist())
 
+def _sidebar_multiselect_with_clear(label, options, state_key, clear_label, format_func=None):
+    """A multiselect that defaults to "all selected" the first time it's seen,
+    persists its selection in session_state under state_key (same pattern as
+    the QA Team Members widget above), and renders its own small "Clear <x>"
+    button directly above it. Matches the existing, working Clear QAs
+    pattern exactly: the button mutates st.session_state[state_key] BEFORE
+    the multiselect widget below it is instantiated in this same script run,
+    so the widget picks up the cleared value immediately with no st.rerun()
+    needed — unlike passing default= each run, which would snap back to
+    "all selected" since nothing would ever persist a cleared state.
+    """
+    if state_key not in st.session_state:
+        st.session_state[state_key] = list(options)
+    # keep state in sync if the available options changed (e.g. new file, or
+    # Years selection narrowing which Months/Weeks exist)
+    st.session_state[state_key] = [v for v in st.session_state[state_key] if v in options]
+
+    if st.sidebar.button(clear_label, use_container_width=True, key=f"{state_key}_clear_btn"):
+        st.session_state[state_key] = []
+
+    kwargs = {"key": state_key}
+    if format_func is not None:
+        kwargs["format_func"] = format_func
+    return st.sidebar.multiselect(label, options, **kwargs)
+
+
 if view_mode == "Yearly":
-    sel_years = st.sidebar.multiselect("Years", years_available, default=years_available)
+    sel_years = _sidebar_multiselect_with_clear("Years", years_available, "years_multiselect", "Clear Years")
     df_period = data[data["Year"].isin(sel_years)]
     period_label = ", ".join(str(y) for y in sel_years) if sel_years else "No years selected"
 
 elif view_mode == "Monthly":
-    sel_years = st.sidebar.multiselect("Years", years_available, default=years_available)
+    sel_years = _sidebar_multiselect_with_clear("Years", years_available, "years_multiselect", "Clear Years")
     months_in_scope = [m for m in MONTH_ORDER if m in data[data["Year"].isin(sel_years)]["Month"].unique()]
-    sel_months = st.sidebar.multiselect("Months", months_in_scope, default=months_in_scope)
+    sel_months = _sidebar_multiselect_with_clear("Months", months_in_scope, "months_multiselect", "Clear Months")
     df_period = data[data["Year"].isin(sel_years) & data["Month"].isin(sel_months)]
-    period_label = f"{', '.join(sel_months) if sel_months else 'No months'} ({', '.join(str(y) for y in sel_years)})"
+    # Dynamic label: "Feb 2026" for a single month/year, "Feb, Mar (2026)"
+    # for several months in one year, "Feb 2025, Mar 2026" if years differ —
+    # never a fixed placeholder string.
+    if not sel_months or not sel_years:
+        period_label = "No months selected"
+    elif len(sel_years) == 1:
+        year_txt = str(sel_years[0])
+        if len(sel_months) == 1:
+            period_label = f"{sel_months[0]} {year_txt}"
+        else:
+            period_label = f"{', '.join(sel_months)} ({year_txt})"
+    else:
+        period_label = f"{', '.join(sel_months)} ({', '.join(str(y) for y in sel_years)})"
 
 elif view_mode == "Weekly":
-    sel_years = st.sidebar.multiselect("Years", years_available, default=years_available)
+    sel_years = _sidebar_multiselect_with_clear("Years", years_available, "years_multiselect", "Clear Years")
     df_y = data[data["Year"].isin(sel_years)]
     df_y = df_y.assign(_week=df_y["Date"].dt.to_period("W"))
     week_options = sorted(df_y["_week"].unique())
     week_labels = {w: f"{w.start_time.strftime('%d %b')} – {w.end_time.strftime('%d %b %Y')}" for w in week_options}
-    sel_weeks = st.sidebar.multiselect(
-        "Weeks", week_options, default=week_options,
+    sel_weeks = _sidebar_multiselect_with_clear(
+        "Weeks", week_options, "weeks_multiselect", "Clear Weeks",
         format_func=lambda w: week_labels.get(w, str(w)),
     )
     df_period = df_y[df_y["_week"].isin(sel_weeks)].drop(columns="_week")
-    period_label = f"{len(sel_weeks)} week(s) selected" if sel_weeks else "No weeks selected"
+    if not sel_weeks:
+        period_label = "No weeks selected"
+    elif len(sel_weeks) == 1:
+        period_label = week_labels.get(sel_weeks[0], str(sel_weeks[0]))
+    else:
+        period_label = f"{len(sel_weeks)} weeks selected"
 
 else:  # Daily -> calendar-style multi-date picker
     min_d, max_d = data["Date"].min().date(), min(data["Date"].max().date(), TODAY.date())
@@ -822,7 +1209,10 @@ else:  # Daily -> calendar-style multi-date picker
     if isinstance(sel_dates, (tuple, list)) and len(sel_dates) == 2:
         d_start, d_end = sel_dates
         df_period = data[(data["Date"].dt.date >= d_start) & (data["Date"].dt.date <= d_end)]
-        period_label = f"{d_start.strftime('%d %b %Y')} – {d_end.strftime('%d %b %Y')}"
+        if d_start == d_end:
+            period_label = d_start.strftime("%d %b %Y")
+        else:
+            period_label = f"{d_start.strftime('%d %b %Y')} – {d_end.strftime('%d %b %Y')}"
     elif isinstance(sel_dates, (tuple, list)) and len(sel_dates) == 1:
         d_only = sel_dates[0]
         df_period = data[data["Date"].dt.date == d_only]
@@ -830,6 +1220,11 @@ else:  # Daily -> calendar-style multi-date picker
     else:
         df_period = data[data["Date"].dt.date == sel_dates]
         period_label = sel_dates.strftime("%d %b %Y")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("\U0001F9F9 Clear All Filters", use_container_width=True):
+    st.session_state["_clear_all_filters"] = True
+    st.rerun()
 
 df_period = df_period[df_period["QA Name"].isin(sel_qas)]
 
@@ -842,6 +1237,7 @@ qa_colors = qa_color_map(all_qas)
 # ============================================================================
 # KPI SUMMARY
 # ============================================================================
+
 # "QA Team Size" reflects how many QAs are CHECKED in the filter — not just
 # how many happen to have logged rows within the current date/month/year
 # window (a QA with zero hours in a narrow window should still count as
@@ -858,15 +1254,16 @@ avg_hours_per_day = (total_hours / (df_period.groupby("QA Name")["Date"].nunique
 kpis = dict(team_size=team_size, billable=billable_total, nonbill=nonbill_total,
             utilization=utilization, total=total_hours)
 
-st.markdown(f'<div class="panel-title" style="margin-bottom:12px;">Summary &nbsp;·&nbsp; {period_label}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="panel-title" style="margin-bottom:12px;">QA &mdash; {period_label}</div>', unsafe_allow_html=True)
 
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 kpi_cells = [
     (k1, "QA TEAM SIZE", f"{team_size}", "active members"),
     (k2, "TOTAL HOURS", f"{total_hours:,.1f}", f"across {days_logged} days"),
     (k3, "BILLABLE SHARE", f"{utilization:.1f}%", f"{billable_total:,.0f} of {total_hours:,.0f} hrs"),
     (k4, "AVG HOURS / DAY", f"{avg_hours_per_day:.2f}", "per active QA-day"),
     (k5, "NON-BILLABLE HOURS", f"{nonbill_total:,.1f}", "hrs logged"),
+    (k6, "HOURS NOT WORKED", f"{notworked_total:,.1f}", "hrs logged"),
 ]
 for col, label, val, sub in kpi_cells:
     with col:
@@ -903,13 +1300,20 @@ with d2:
 team_chart_figs = [
     ("QA Comparison — Total Hours", fig_bar),
     ("Hours Mix", fig_mix),
-    ("Overall Hours Split (Donut)", fig_donut),
+    ("Team Utilization Split (Donut)", fig_donut),
 ]
 
 # ============================================================================
 # PER-QA CARDS
 # ============================================================================
-st.markdown('<div class="panel-title">Individual QA Breakdown</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="panel-title">Individual QA Breakdown</div>'
+    '<div class="panel-sub" style="margin-top:2px;">'
+    'The number in the center of each donut is that QA\u2019s <b>Billable Hours \u00f7 Total Hours</b> '
+    '(billable share of their own hours) for the period selected above \u2014 not a share of the whole team.'
+    '</div>',
+    unsafe_allow_html=True,
+)
 st.write("")
 
 qa_summary = df_period.groupby("QA Name").agg(
@@ -926,7 +1330,11 @@ qa_summary["Utilization %"] = np.where(
     qa_summary["Billable Hours"] / qa_summary["Total Hours"] * 100,
     0,
 )
-qa_summary = qa_summary.sort_values("Utilization %", ascending=False)
+# Canonical sort applied everywhere in the app: Total Hours, descending.
+# qa_summary feeds the breakdown cards below, the "View Per-QA Summary
+# Table" expander, and both the Excel and PDF exports — sorting it here
+# once keeps all of those consistent with the bar chart and stacked chart.
+qa_summary = qa_summary.sort_values("Total Hours", ascending=False)
 
 n_cols = 3
 qa_rows = [qa_summary.iloc[i:i + n_cols] for i in range(0, len(qa_summary), n_cols)]
@@ -947,11 +1355,14 @@ for chunk in qa_rows:
                              key=f"mini_{row['QA Name']}_{period_label}")
             qa_mini_figs.append((row["QA Name"], mini_fig))
 
-# ============================================================================
-# DAILY LOG TABLE
-# ============================================================================
+
+
 st.markdown('<div class="panel-title" style="margin-top:1.2rem;">Daily Log</div>', unsafe_allow_html=True)
-st.caption("Every cleaned daily record for the QAs and period selected in the sidebar filters · sortable")
+st.caption(
+    "Every cleaned daily record for the QAs and period selected in the sidebar filters · sortable. "
+    "All rows are shown in this one scrollable table (no separate pages) — scroll inside the "
+    "table itself, vertically for more rows and horizontally for the Comment column, to see everything."
+)
 
 log_df = df_period.copy()
 
@@ -959,8 +1370,34 @@ log_df_display = log_df[["Date", "Day", "QA Name", "Billable Hours", "Non-Billab
                           "Hours Not Worked", "Total Hours", "Comment"]].sort_values("Date", ascending=False)
 log_df_display["Date"] = log_df_display["Date"].dt.strftime("%Y-%m-%d")
 
-st.dataframe(log_df_display.round(2), use_container_width=True, hide_index=True, height=380)
-st.caption(f"{len(log_df_display):,} rows")
+st.dataframe(
+    log_df_display.round(2),
+    use_container_width=True,
+    hide_index=True,
+    height=380,
+    column_config={
+        "Date": st.column_config.TextColumn("Date", width=95),
+        "Day": st.column_config.TextColumn("Day", width=60),
+        "QA Name": st.column_config.TextColumn("QA Name", width=150),
+        "Billable Hours": st.column_config.NumberColumn("Billable Hours", width=100, format="%.2f"),
+        "Non-Billable Hours": st.column_config.NumberColumn("Non-Billable Hours", width=110, format="%.2f"),
+        "Hours Not Worked": st.column_config.NumberColumn("Hours Not Worked", width=110, format="%.2f"),
+        "Total Hours": st.column_config.NumberColumn("Total Hours", width=100, format="%.2f"),
+        # Comment's explicit width, combined with the explicit widths above,
+        # sums to well past any realistic rendered table width even with
+        # use_container_width=True -- that's what makes the grid's built-in
+        # horizontal scroll actually engage (confirmed directly: scrolling
+        # the grid horizontally does bring later columns and more Comment
+        # text into view). The scrollbar itself has no visible indicator in
+        # Streamlit's grid (a real, confirmed platform limitation, not a bug
+        # in this app).
+        "Comment": st.column_config.TextColumn(
+            "Comment", width=500,
+            help="Long comments are truncated here — scroll the table sideways, or drag this column's edge to widen it, to read one in full.",
+        ),
+    },
+)
+st.caption(f"{len(log_df_display):,} rows total \u00b7 all shown above, scroll to see the rest \u00b7 the table also scrolls sideways for the Comment column, though the scrollbar itself isn't always visible")
 
 with st.expander("\U0001F4CB View Per-QA Summary Table"):
     st.dataframe(
@@ -986,22 +1423,107 @@ export_detail = df_period[["QA Name", "Date", "Day", "Month", "Billable Hours",
 prepare_clicked = st.button("\u2699\ufe0f Prepare Exports", type="primary", use_container_width=False)
 
 if prepare_clicked:
-    with st.spinner("Building Excel and PDF reports..."):
-        st.session_state["export_excel_bytes"] = to_excel_bytes(
-            export_summary, export_detail, kpis, period_label, team_chart_figs, qa_mini_figs)
-        st.session_state["export_pdf_bytes"] = to_pdf_bytes(
-            export_summary, export_detail, kpis, period_label, team_chart_figs, qa_mini_figs)
-        st.session_state["export_period_label"] = period_label
-    st.success("Exports ready below \u2014 changing filters now will NOT regenerate them until you click Prepare Exports again.")
+    st.session_state["_run_export_build"] = True
+
+if st.session_state.get("_run_export_build"):
+    st.session_state["_run_export_build"] = False
+
+    if "_kaleido_check_cache" in st.session_state:
+        # Already probed once this session -- reuse that result instead of
+        # spending another up-to-KALEIDO_TIMEOUT_SECONDS on a question we
+        # already have the answer to. This is invalidated (see the Chrome
+        # install button below) whenever there's a real reason the answer
+        # might have changed.
+        kaleido_ok, kaleido_msg, chrome_missing = st.session_state["_kaleido_check_cache"]
+    else:
+        with st.spinner(f"Checking chart rendering (up to {KALEIDO_PROBE_TIMEOUT_SECONDS}s, once per session)..."):
+            kaleido_ok, kaleido_msg, chrome_missing = _check_kaleido_available()
+        st.session_state["_kaleido_check_cache"] = (kaleido_ok, kaleido_msg, chrome_missing)
+
+    if not kaleido_ok:
+        st.warning(
+            f"{kaleido_msg}\n\n"
+            "Proceeding to build the Excel and PDF **without chart images** — "
+            "all KPI numbers, the per-QA summary table, and the full Daily Log "
+            "will still be complete."
+        )
+        if chrome_missing:
+            if st.button("\U0001F310 Install Chrome for Exports (one-time, ~100MB)"):
+                try:
+                    import plotly.io as pio
+                    with st.spinner("Downloading Chrome for chart rendering \u2014 this can take a minute..."):
+                        _run_with_timeout(pio.get_chrome, 120)
+                    st.success("Chrome installed. Building your exports now...")
+                    st.session_state.pop("_kaleido_check_cache", None)
+                    st.session_state["_run_export_build"] = True
+                    st.rerun()
+                except Exception as install_err:
+                    st.error(
+                        f"Automatic Chrome install failed: {install_err}\n\n"
+                        "Please install Chrome manually from google.com/chrome, "
+                        "then restart the Streamlit app and click Prepare Exports again."
+                    )
+
+    chart_pngs = {}
+    mini_pngs = {}
+    if kaleido_ok:
+        with st.spinner("Rendering charts (once, shared by both Excel and PDF)..."):
+            # Render at the LARGER of the two destinations' needs (Excel's
+            # 560x311 / 220x220 vs PDF's 555x320 / 165x165) -- the same PNG
+            # then gets displayed slightly smaller in the PDF, which is safe
+            # downscaling with no visible quality loss, and means each figure
+            # is rendered exactly once instead of once per export format.
+            for title, fig in team_chart_figs:
+                try:
+                    chart_pngs[title] = _fig_to_png_bytes(fig, width=560, height=311)
+                except Exception:
+                    pass  # left out of the dict; both builders already handle a missing entry
+            for qa_name, fig in qa_mini_figs:
+                try:
+                    mini_pngs[qa_name] = _fig_to_png_bytes(fig, width=220, height=220)
+                except Exception:
+                    pass
+
+    try:
+        with st.spinner("Building Excel and PDF reports..."):
+            chart_titles = [title for title, _ in team_chart_figs]
+            qa_names_for_export = [qa_name for qa_name, _ in qa_mini_figs]
+            excel_buf, excel_images_failed = to_excel_bytes(
+                export_summary, export_detail, kpis, period_label,
+                chart_titles, chart_pngs, qa_names_for_export, mini_pngs,
+                include_images=kaleido_ok)
+            pdf_buf, pdf_images_failed = to_pdf_bytes(
+                export_summary, export_detail, kpis, period_label,
+                chart_titles, chart_pngs, qa_names_for_export, mini_pngs,
+                include_images=kaleido_ok)
+            st.session_state["export_excel_bytes"] = excel_buf
+            st.session_state["export_pdf_bytes"] = pdf_buf
+            st.session_state["export_period_label"] = period_label
+            st.session_state["export_filename_base"] = _build_export_filename_base(period_label, sel_qas, all_qas)
+            st.session_state["export_generated_at"] = datetime.now().strftime("%d %b %Y, %H:%M:%S")
+
+        if kaleido_ok and not excel_images_failed and not pdf_images_failed:
+            st.success("Exports ready below, with all charts included \u2014 changing filters now will NOT regenerate them until you click Prepare Exports again.")
+        else:
+            st.info("Exports ready below \u2014 data-complete, but some chart images could not be rendered (see warning above). Changing filters now will NOT regenerate them until you click Prepare Exports again.")
+    except Exception as e:
+        st.error(f"Export generation failed: {e}")
+        st.session_state.pop("export_excel_bytes", None)
+        st.session_state.pop("export_pdf_bytes", None)
 
 if "export_excel_bytes" in st.session_state:
+    gen_at = st.session_state.get("export_generated_at", "unknown time")
+    st.caption(f"\u2705 These exports were generated at **{gen_at}**. If that's not recent, click Prepare Exports again after fixing any errors above.")
     e1, e2 = st.columns(2)
-    fname_period = st.session_state.get("export_period_label", period_label).replace(" ", "_").replace(",", "")
+    fname_base = st.session_state.get(
+        "export_filename_base",
+        _build_export_filename_base(st.session_state.get("export_period_label", period_label), sel_qas, all_qas),
+    )
     with e1:
         st.download_button(
             "\U0001F4E5 Download Excel",
             data=st.session_state["export_excel_bytes"],
-            file_name=f"QA_Dashboard_{fname_period}.xlsx",
+            file_name=f"{fname_base}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -1009,7 +1531,7 @@ if "export_excel_bytes" in st.session_state:
         st.download_button(
             "\U0001F4C4 Download PDF",
             data=st.session_state["export_pdf_bytes"],
-            file_name=f"QA_Dashboard_{fname_period}.pdf",
+            file_name=f"{fname_base}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
