@@ -601,28 +601,34 @@ def _run_with_timeout(fn, timeout_seconds, *args, **kwargs):
 
 
 def _check_kaleido_available():
-    """Kaleido (>=1.3.0, see requirements.txt) is required to turn Plotly
-    figures into static images for the Excel/PDF exports. A successful
-    `import kaleido` does NOT guarantee fig.to_image() actually works —
-    kaleido v1 needs a real Chrome/Chromium installation on the machine (it
-    no longer bundles one, unlike the old 0.2.1 that's no longer used here),
-    and if that's missing it raises a clear "Chrome not installed"
-    RuntimeError rather than hanging. This still runs a real, tiny,
-    TIME-LIMITED end-to-end render so a broken install is always caught
-    quickly instead of silently producing blank chart pages.
+    """Kaleido (==0.2.1, see requirements.txt) is required to turn Plotly
+    figures into static images for the Excel/PDF exports.
 
-    Returns (ok: bool, message: str | None, chrome_missing: bool). When
-    chrome_missing is True, the caller can offer a one-click "Install
-    Chrome" button (see the Export section) rather than this function
-    silently starting a ~100MB+ download on its own — a health check
-    shouldn't have a surprise multi-second network side effect."""
+    We deliberately use kaleido 0.2.1, NOT the newer 1.x line. 0.2.1 ships its
+    OWN Chromium inside the wheel, so it renders fully offline with no separate
+    Chrome install, no network download, and no "Install Chrome" step. That is
+    exactly what lets the app be frozen into a self-contained Windows .exe /
+    Mac app: PyInstaller can bundle kaleido's Chromium alongside the rest, and
+    the end user needs nothing else on their machine. (kaleido 1.x removed the
+    bundled browser and instead depends on a system Chrome at run time, which
+    is fragile to ship in a frozen executable — hence the pin back to 0.2.1.)
+
+    A successful `import kaleido` still doesn't 100% guarantee fig.to_image()
+    works in every environment, so this runs a real, tiny, TIME-LIMITED
+    end-to-end render to catch a broken install quickly instead of silently
+    producing blank chart pages.
+
+    Returns (ok: bool, message: str | None, chrome_missing: bool). Because
+    0.2.1 has no separate Chrome dependency, chrome_missing is ALWAYS False —
+    there is no external browser to install — so the caller's optional
+    "Install Chrome" button (a kaleido-1.x-only affordance) never triggers."""
     try:
         import kaleido  # noqa: F401
     except ImportError:
         return False, (
             "The 'kaleido' package is not installed, so charts cannot be "
             "rendered into the Excel/PDF exports. Install it with:\n\n"
-            "    pip install kaleido==1.3.0\n\n"
+            "    pip install kaleido==0.2.1\n\n"
             "then restart the app and click Prepare Exports again."
         ), False
 
@@ -637,26 +643,18 @@ def _check_kaleido_available():
         _run_with_timeout(_probe, KALEIDO_PROBE_TIMEOUT_SECONDS)
         return True, None, False
     except Exception as e:
-        chrome_missing = "chrome" in str(e).lower()
-        if chrome_missing:
-            return False, (
-                "Kaleido needs a real Chrome installation on this machine to "
-                "render charts \u2014 it no longer bundles one (unlike the older "
-                "kaleido 0.2.1). Click **Install Chrome for Exports** below to "
-                "fetch it automatically (~100MB, one-time, takes a minute), or "
-                "install Chrome yourself from google.com/chrome. Either way, "
-                "restart the Streamlit app afterwards and click Prepare "
-                "Exports again."
-            ), True
+        # With 0.2.1 there is no "Chrome not installed" case (Chromium is
+        # bundled), so we never flag chrome_missing. Any failure here is an
+        # environment/version-mismatch issue, reported as such.
         return False, (
-            f"Kaleido failed a quick test export ({e}). Chrome appears to be "
-            "installed, so this is likely a version mismatch \u2014 make sure "
-            "`kaleido` and `plotly` are both current:\n\n"
-            "    pip install --upgrade kaleido plotly\n\n"
-            "(a kaleido older than 1.3.0 paired with a newer plotly is a "
-            "known source of export errors), then fully restart the "
-            "Streamlit app (not just refresh the browser) and click Prepare "
-            "Exports again."
+            f"Kaleido failed a quick test export ({e}). This build pins "
+            "kaleido==0.2.1 and plotly==6.1.1, a verified-compatible pair that "
+            "bundles its own Chromium and needs no separate Chrome install. "
+            "If you see this, your installed versions likely drifted \u2014 "
+            "reinstall the pinned versions:\n\n"
+            "    pip install \"kaleido==0.2.1\" \"plotly==6.1.1\"\n\n"
+            "then fully restart the app (not just refresh the browser) and "
+            "click Prepare Exports again."
         ), False
 
 
@@ -679,6 +677,215 @@ def _fig_to_png_bytes(fig, width=900, height=500, scale=2):
             "that kaleido depends on)."
         )
     return png_bytes
+
+
+# ============================================================================
+# EXPORT CHART RENDERERS (matplotlib)
+# ----------------------------------------------------------------------------
+# The STATIC chart PNGs embedded in the Excel/PDF exports are rendered here
+# with matplotlib, NOT with kaleido/Plotly. This is deliberate: matplotlib has
+# no headless-browser/Chromium dependency, renders instantly with no
+# subprocess or timeout, behaves identically on a laptop, a server, or a
+# frozen PyInstaller .exe, and needs nothing installed beyond the Python
+# package. kaleido (either the 1.x line that needs a system Chrome, or the
+# 0.2.1 line whose bundled Chromium hangs on some machines) was the single
+# source of "the PDF has no charts" problems, so the export path no longer
+# touches it at all.
+#
+# The on-screen interactive dashboard still uses the Plotly figures
+# (donut_chart / bar_chart_by_qa / hours_mix_chart / qa_mini_donut) exactly as
+# before — only the exported images come from these matplotlib twins, drawn
+# from the same aggregated data and the same palette so the PDF/Excel look
+# like the live dashboard.
+# ============================================================================
+def _mpl():
+    """Import matplotlib lazily (keeps app startup light) and return its
+    pyplot + Patch handles. Agg backend = headless, safe everywhere."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    return plt, Patch
+
+
+def _mpl_fig_png(fig, plt, dpi=200):
+    b = io.BytesIO()
+    fig.savefig(b, format="png", dpi=dpi, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close(fig)
+    b.seek(0)
+    return b.getvalue()
+
+
+def mpl_team_donut(billable, nonbill, notworked):
+    """Big team-utilization donut: three slices + center utilization %, with a
+    compact legend baked in so the image is self-contained."""
+    import math
+    plt, Patch = _mpl()
+    vals = [max(0.0, billable), max(0.0, nonbill), max(0.0, notworked)]
+    total = sum(vals) or 1.0
+    util = billable / total * 100.0
+
+    fig, ax = plt.subplots(figsize=(4.4, 4.6))
+    wedges, _ = ax.pie(
+        vals, colors=[BILLABLE_COLOR, NONBILL_COLOR, NOTWORKED_COLOR],
+        startangle=90, counterclock=False,
+        wedgeprops=dict(width=0.38, edgecolor="white", linewidth=3),
+    )
+    for w, v in zip(wedges, vals):
+        ang = (w.theta2 + w.theta1) / 2.0
+        pct = v / total * 100.0
+        if pct >= 4:
+            ax.text(0.80 * math.cos(math.radians(ang)),
+                    0.80 * math.sin(math.radians(ang)),
+                    f"{pct:.1f}%", ha="center", va="center",
+                    color="white", fontsize=11, fontweight="bold")
+    ax.text(0, 0.08, f"{util:.0f}%", ha="center", va="center",
+            fontsize=30, fontweight="bold", color=TEXT_MAIN)
+    ax.text(0, -0.16, "Utilization", ha="center", va="center",
+            fontsize=11, color=TEXT_MUTED)
+    ax.set_aspect("equal")
+    handles = [Patch(facecolor=BILLABLE_COLOR, label="Billable"),
+               Patch(facecolor=NONBILL_COLOR, label="Non-Billable"),
+               Patch(facecolor=NOTWORKED_COLOR, label="Not Worked")]
+    ax.legend(handles=handles, loc="lower center", ncol=3,
+              bbox_to_anchor=(0.5, -0.10), frameon=False, fontsize=10,
+              handlelength=1.1, handleheight=1.1, columnspacing=1.4)
+    fig.subplots_adjust(top=0.98, bottom=0.06, left=0.02, right=0.98)
+    return _mpl_fig_png(fig, plt)
+
+
+def mpl_bar_total(summary_df):
+    """Horizontal Total-Hours-per-QA bars, highest at top, teal magnitude
+    scale, value labels at the ends."""
+    plt, _ = _mpl()
+    grp = summary_df[["QA Name", "Total Hours"]].copy().sort_values("Total Hours", ascending=True)
+    names = grp["QA Name"].tolist()
+    vals = grp["Total Hours"].tolist()
+    mx = max(vals) if vals else 0
+    colors = [_teal_scale(v / mx if mx else 0) for v in vals]
+
+    h = max(2.5, 0.26 * len(names) + 0.9)
+    fig, ax = plt.subplots(figsize=(12.0, h))
+    bars = ax.barh(names, vals, color=colors, edgecolor="none", height=0.68)
+    ax.set_xlabel("Hours", fontsize=10, color=TEXT_MUTED)
+    ax.grid(axis="x", color=BORDER, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for s in ["top", "right", "left"]:
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color(BORDER)
+    ax.tick_params(axis="y", length=0, labelsize=10)
+    ax.tick_params(axis="x", length=0, labelsize=9, colors=TEXT_MUTED)
+    pad = (mx * 0.02) if mx else 0.5
+    for b, v in zip(bars, vals):
+        ax.text(b.get_width() + pad, b.get_y() + b.get_height() / 2,
+                f"{v:,.1f}", va="center", ha="left", fontsize=9,
+                color=TEXT_MAIN, fontweight="bold")
+    ax.set_xlim(0, (mx * 1.14) if mx else 1)
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.12)
+    return _mpl_fig_png(fig, plt)
+
+
+def mpl_hours_mix(summary_df):
+    """Stacked vertical bars per QA (Billable / Non-Billable / Not Worked),
+    sorted by total hours descending, legend beneath."""
+    plt, _ = _mpl()
+    grp = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked"]].copy()
+    grp["__t"] = grp["Billable Hours"] + grp["Non-Billable Hours"] + grp["Hours Not Worked"]
+    grp = grp.sort_values("__t", ascending=False)
+    names = grp["QA Name"].tolist()
+    bill = grp["Billable Hours"].tolist()
+    non = grp["Non-Billable Hours"].tolist()
+    notw = grp["Hours Not Worked"].tolist()
+
+    fig, ax = plt.subplots(figsize=(12.0, 2.95))
+    x = list(range(len(names)))
+    ax.bar(x, bill, color=BILLABLE_COLOR, label="Billable", width=0.62)
+    ax.bar(x, non, bottom=bill, color=NONBILL_COLOR, label="Non-Billable", width=0.62)
+    bottom2 = [b + n for b, n in zip(bill, non)]
+    ax.bar(x, notw, bottom=bottom2, color=NOTWORKED_COLOR, label="Not Worked", width=0.62)
+    ax.set_ylabel("Hours", fontsize=10, color=TEXT_MUTED)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=25, ha="right", fontsize=9)
+    ax.grid(axis="y", color=BORDER, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for s in ["top", "right"]:
+        ax.spines[s].set_visible(False)
+    ax.spines["left"].set_color(BORDER)
+    ax.spines["bottom"].set_color(BORDER)
+    ax.tick_params(length=0, labelsize=9, colors=TEXT_MUTED)
+    ax.tick_params(axis="x", colors=TEXT_MAIN)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=3,
+              frameon=False, fontsize=10)
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.98, bottom=0.28)
+    return _mpl_fig_png(fig, plt)
+
+
+def mpl_mini_donut(billable, nonbill, notworked):
+    """Small per-QA donut with center utilization % and inside slice labels."""
+    import math
+    plt, _ = _mpl()
+    vals = [max(0.0, billable), max(0.0, nonbill), max(0.0, notworked)]
+    total = sum(vals) or 1.0
+    util = billable / total * 100.0
+
+    fig, ax = plt.subplots(figsize=(2.6, 2.6))
+    wedges, _ = ax.pie(
+        vals, colors=[BILLABLE_COLOR, NONBILL_COLOR, NOTWORKED_COLOR],
+        startangle=90, counterclock=False,
+        wedgeprops=dict(width=0.35, edgecolor="white", linewidth=2),
+    )
+    for w, v in zip(wedges, vals):
+        ang = (w.theta2 + w.theta1) / 2.0
+        pct = v / total * 100.0
+        if pct >= 6:
+            ax.text(0.82 * math.cos(math.radians(ang)),
+                    0.82 * math.sin(math.radians(ang)),
+                    f"{pct:.0f}%", ha="center", va="center", color="white",
+                    fontsize=8, fontweight="bold")
+    ax.text(0, 0.06, f"{util:.0f}%", ha="center", va="center",
+            fontsize=17, fontweight="bold", color=TEXT_MAIN)
+    ax.text(0, -0.20, "Utilization", ha="center", va="center",
+            fontsize=7, color=TEXT_MUTED)
+    ax.set_aspect("equal")
+    fig.subplots_adjust(top=0.99, bottom=0.01, left=0.01, right=0.99)
+    return _mpl_fig_png(fig, plt)
+
+
+def build_export_chart_pngs(summary_df, billable, nonbill, notworked, chart_titles, qa_names):
+    """Render every export chart with matplotlib and return
+    (chart_pngs, mini_pngs) keyed exactly the way to_excel_bytes / to_pdf_bytes
+    expect (chart_pngs by title, mini_pngs by QA name). Each render is guarded
+    so one bad figure can't sink the whole export; a figure that fails is
+    simply omitted and the builders fall back to their data tables for it."""
+    chart_pngs, mini_pngs = {}, {}
+
+    # Map each known chart title to its renderer. Titles come from
+    # team_chart_figs so ordering/labels stay identical to the on-screen set.
+    for title in chart_titles:
+        try:
+            low = title.lower()
+            if "donut" in low or "utilization" in low:
+                chart_pngs[title] = mpl_team_donut(billable, nonbill, notworked)
+            elif "mix" in low:
+                chart_pngs[title] = mpl_hours_mix(summary_df)
+            else:  # "QA Comparison — Total Hours"
+                chart_pngs[title] = mpl_bar_total(summary_df)
+        except Exception:
+            pass
+
+    by_name = {r["QA Name"]: r for _, r in summary_df.iterrows()}
+    for qa_name in qa_names:
+        row = by_name.get(qa_name)
+        if row is None:
+            continue
+        try:
+            mini_pngs[qa_name] = mpl_mini_donut(
+                row["Billable Hours"], row["Non-Billable Hours"], row["Hours Not Worked"])
+        except Exception:
+            pass
+
+    return chart_pngs, mini_pngs
 
 
 def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_pngs, qa_names, mini_pngs, include_images=True):
@@ -733,7 +940,14 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, char
             png = chart_pngs.get(title)
             if png is not None:
                 img = XLImage(io.BytesIO(png))
-                img.width, img.height = 560, 311
+                # Size to each chart's natural aspect so the matplotlib images
+                # aren't distorted: the team donut is square, the bar/mix
+                # charts are wide.
+                low = title.lower()
+                if "donut" in low or "utilization" in low:
+                    img.width, img.height = 340, 340
+                else:
+                    img.width, img.height = 700, 188
                 ws.add_image(img, f"B{row_cursor}")
                 row_cursor += 20
             else:
@@ -760,7 +974,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, char
             else:
                 images_failed = True
     else:
-        ws[f"B{row_cursor}"] = "Chart images were skipped for this export (kaleido unavailable). All figures are in the tables below."
+        ws[f"B{row_cursor}"] = "Chart images were skipped for this export. All figures are in the tables below."
         ws[f"B{row_cursor}"].font = note_font
         row_cursor += 2
 
@@ -793,279 +1007,676 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, char
     return buf, images_failed
 
 
-def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_pngs, qa_names, mini_pngs, include_images=True):
+DEFAULT_PDF_SECTIONS = {
+    "Team Overview": True,
+    "Individual QA Breakdown": True,
+    "Per-QA Summary Table": True,
+    # Daily Log is the one section that can genuinely run to hundreds of rows
+    # and several pages on its own, so — unlike the other three — it starts
+    # OFF by default. The person exporting opts in via the checkbox in the
+    # Export panel rather than always getting a long log table by default.
+    "Daily Log": False,
+}
+
+
+def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_pngs, qa_names, mini_pngs,
+                  include_images=True, sections=None):
     """chart_pngs and mini_pngs are the SAME already-rendered PNG dicts passed
     to to_excel_bytes -- rendering happens exactly once per figure, shared
-    between both export formats, rather than once per format."""
+    between both export formats, rather than once per format.
+
+    `sections` controls which of the 4 top-level report sections
+    ("Team Overview", "Individual QA Breakdown", "Per-QA Summary Table",
+    "Daily Log") are actually written into the PDF -- this only affects the
+    PDF. summary_df/detail_df themselves are unchanged, and to_excel_bytes is
+    a completely separate function that always writes every section
+    regardless of what's passed here, so the Excel export is unaffected by
+    this toggle. A section that's turned off is skipped entirely (no heading,
+    no placeholder, no reserved space) rather than merely hidden, so turning
+    a section off also shortens the PDF. Defaults to DEFAULT_PDF_SECTIONS
+    (everything on except Daily Log) when not provided, so any older caller
+    that doesn't pass sections still gets the previous full-report behavior.
+
+    --- Redesign note ---------------------------------------------------------
+    This builder was fully re-styled into a "dashboard on paper" layout that
+    mirrors the on-screen app: a dark navy header band, colored KPI tiles, a
+    hero Team Utilization donut sitting beside supporting charts, an evenly
+    spaced Individual QA donut grid that fills the page, and a polished summary
+    table. Every page carries a footer rule + page number via the page
+    decorator. NONE of the underlying data/logic changed -- the same
+    summary_df / detail_df / kpis / chart_pngs / mini_pngs feed it, section
+    toggles are honored identically, and the image-fallback tables are kept so
+    a kaleido-less environment still produces a complete document.
+    """
+    if sections is None:
+        sections = DEFAULT_PDF_SECTIONS
+    show_team_overview = sections.get("Team Overview", True)
+    show_individual_breakdown = sections.get("Individual QA Breakdown", True)
+    show_summary_table = sections.get("Per-QA Summary Table", True)
+    show_daily_log = sections.get("Daily Log", True)
+
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
     from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle, Paragraph,
-                                     Spacer, Image as RLImage, PageBreak, KeepTogether)
+                                     Spacer, Image as RLImage, PageBreak, KeepTogether,
+                                     Flowable)
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+    # ---- Palette (kept identical to the app's constants) --------------------
+    C_INK = rl_colors.HexColor("#0F1729")
+    C_INK2 = rl_colors.HexColor("#1B2540")
+    C_PAGE = rl_colors.HexColor("#F4F5F8")
+    C_BORDER = rl_colors.HexColor("#E7E9F0")
+    C_TEXT = rl_colors.HexColor("#1F2333")
+    C_MUTED = rl_colors.HexColor("#7A7F91")
+    C_BILL = rl_colors.HexColor("#2F9E8F")
+    C_NONBILL = rl_colors.HexColor("#E0A72E")
+    C_NOTWORKED = rl_colors.HexColor("#C1543D")
+    C_WHITE = rl_colors.white
+
+    # Landscape A4 usable width with 12mm side margins ~= 273mm -> 774pt.
+    PAGE_W, PAGE_H = landscape(A4)
+    L_MARGIN = R_MARGIN = 12 * mm
+    CONTENT_W = PAGE_W - L_MARGIN - R_MARGIN  # ~ 773pt
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
-                             topMargin=16 * mm, bottomMargin=14 * mm,
-                             leftMargin=14 * mm, rightMargin=14 * mm)
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4),
+        topMargin=13 * mm, bottomMargin=13 * mm,
+        leftMargin=L_MARGIN, rightMargin=R_MARGIN,
+        title="QA Work Hours Dashboard Report",
+    )
+
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("Title2", parent=styles["Title"], fontSize=18,
-                                  textColor=rl_colors.HexColor("#0F1729"))
-    sub_style = ParagraphStyle("Sub", parent=styles["Normal"], fontSize=10,
-                                textColor=rl_colors.HexColor("#7A7F91"))
-    h2_style = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13,
-                               textColor=rl_colors.HexColor("#0F1729"), spaceBefore=6, spaceAfter=6)
 
-    elements = [
-        Paragraph("QA Work Hours Dashboard Report", title_style),
-        Paragraph(f"Period: {period_label} &nbsp;|&nbsp; Generated: {datetime.now().strftime('%d %b %Y, %H:%M')}", sub_style),
-        Spacer(1, 10),
-    ]
+    def _p(name, **kw):
+        base = kw.pop("parent", styles["Normal"])
+        return ParagraphStyle(name, parent=base, **kw)
 
-    kpi_data = [["QA Team Size", "Billable Hours", "Non-Billable Hours", "Utilization %", "Total Hours"],
-                [str(kpis["team_size"]), f'{kpis["billable"]:.1f}', f'{kpis["nonbill"]:.1f}',
-                 f'{kpis["utilization"]:.1f}%', f'{kpis["total"]:.1f}']]
-    kpi_table = Table(kpi_data, colWidths=[150] * 5)
-    kpi_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-        ("TOPPADDING", (0, 0), (-1, 0), 8),
-        ("BACKGROUND", (0, 1), (-1, 1), rl_colors.HexColor("#F4F5F8")),
-        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#E7E9F0")),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-    ]))
-    elements.append(kpi_table)
-    elements.append(Spacer(1, 14))
+    st_section = _p("SecHead", fontSize=15, leading=18, textColor=C_INK,
+                    fontName="Helvetica-Bold", spaceBefore=0, spaceAfter=2)
+    st_section_sub = _p("SecSub", fontSize=8.5, leading=11, textColor=C_MUTED,
+                        fontName="Helvetica", spaceAfter=4)
+    st_chart_cap = _p("ChartCap", fontSize=9.5, leading=12, textColor=C_INK,
+                      fontName="Helvetica-Bold", alignment=TA_CENTER)
+    st_qa_name = _p("QAName", fontSize=9.5, leading=12, textColor=C_INK,
+                    fontName="Helvetica-Bold", alignment=TA_CENTER)
+    st_note = _p("Note", fontSize=8.5, leading=11, textColor=C_MUTED,
+                 fontName="Helvetica-Oblique")
 
+    # ------------------------------------------------------------------ #
+    #  Page furniture: header band (first page) + footer on every page   #
+    # ------------------------------------------------------------------ #
+    gen_str = datetime.now().strftime('%d %b %Y, %H:%M')
+
+    def _draw_footer(canvas, doc_):
+        canvas.saveState()
+        y = 9 * mm
+        canvas.setStrokeColor(C_BORDER)
+        canvas.setLineWidth(0.6)
+        canvas.line(L_MARGIN, y + 4, PAGE_W - R_MARGIN, y + 4)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(C_MUTED)
+        canvas.drawString(L_MARGIN, y - 4, "QA Work Hours Dashboard")
+        canvas.drawCentredString(PAGE_W / 2.0, y - 4, f"Period: {period_label}")
+        canvas.drawRightString(PAGE_W - R_MARGIN, y - 4, f"Page {doc_.page}")
+        canvas.restoreState()
+
+    def _first_page(canvas, doc_):
+        # Full-bleed navy header banner across the very top of page 1.
+        canvas.saveState()
+        band_h = 20 * mm
+        top = PAGE_H
+        canvas.setFillColor(C_INK)
+        canvas.rect(0, top - band_h, PAGE_W, band_h, stroke=0, fill=1)
+        # thin teal accent line under the band
+        canvas.setFillColor(C_BILL)
+        canvas.rect(0, top - band_h - 2, PAGE_W, 2, stroke=0, fill=1)
+        # eyebrow + title
+        canvas.setFillColor(rl_colors.HexColor("#8B93AD"))
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.drawString(L_MARGIN, top - 8 * mm, "QA MANAGEMENT SYSTEM  ·  ANALYTICS REPORT")
+        canvas.setFillColor(C_WHITE)
+        canvas.setFont("Helvetica-Bold", 19)
+        canvas.drawString(L_MARGIN, top - 15 * mm, "QA Work Hours Dashboard")
+        # right-aligned meta
+        canvas.setFillColor(rl_colors.HexColor("#B9C0D4"))
+        canvas.setFont("Helvetica", 8.5)
+        canvas.drawRightString(PAGE_W - R_MARGIN, top - 8.5 * mm, f"Period: {period_label}")
+        canvas.drawRightString(PAGE_W - R_MARGIN, top - 13.5 * mm, f"Generated: {gen_str}")
+        canvas.restoreState()
+        _draw_footer(canvas, doc_)
+
+    # ------------------------------------------------------------------ #
+    #  Small reusable flowables                                          #
+    # ------------------------------------------------------------------ #
+    class HRule(Flowable):
+        """A thin full-width divider rule."""
+        def __init__(self, width, color=C_BORDER, thickness=0.7):
+            super().__init__()
+            self.width = width
+            self.color = color
+            self.thickness = thickness
+
+        def wrap(self, aw, ah):
+            return (self.width, self.thickness + 2)
+
+        def draw(self):
+            self.canv.setStrokeColor(self.color)
+            self.canv.setLineWidth(self.thickness)
+            self.canv.line(0, 1, self.width, 1)
+
+    class BarMeter(Flowable):
+        """A slim rounded progress bar: a light track with a colored fill
+        showing `frac` (0..1). Used in the Utilization Breakdown panel."""
+        def __init__(self, width, frac, color, height=7, track=rl_colors.HexColor("#EEF0F4")):
+            super().__init__()
+            self.width = width
+            self.frac = max(0.0, min(1.0, frac))
+            self.color = color
+            self.height = height
+            self.track = track
+
+        def wrap(self, aw, ah):
+            return (self.width, self.height)
+
+        def draw(self):
+            r = self.height / 2.0
+            c = self.canv
+            c.setFillColor(self.track)
+            c.roundRect(0, 0, self.width, self.height, r, stroke=0, fill=1)
+            fill_w = max(self.height, self.width * self.frac) if self.frac > 0 else 0
+            if fill_w > 0:
+                c.setFillColor(self.color)
+                c.roundRect(0, 0, fill_w, self.height, r, stroke=0, fill=1)
+
+    def _kpi_tile(label, value, sub, accent):
+        """One rounded KPI tile as a single-cell Table so it gets a border,
+        a colored accent strip up top, and stacked label/value/sub text."""
+        inner = Table(
+            [[Paragraph(label, _p("kl", fontSize=7.5, leading=9, textColor=C_MUTED,
+                                  fontName="Helvetica-Bold"))],
+             [Paragraph(value, _p("kv", fontSize=17, leading=19, textColor=C_INK,
+                                  fontName="Helvetica-Bold"))],
+             [Paragraph(sub, _p("ks", fontSize=7, leading=9, textColor=C_MUTED,
+                                fontName="Helvetica"))]],
+            colWidths=[CONTENT_W / 6.0 - 6],
+        )
+        inner.setStyle(TableStyle([
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (0, 0), 3),
+            ("BOTTOMPADDING", (0, 1), (0, 1), 2),
+            ("BOTTOMPADDING", (0, 2), (0, 2), 0),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("LINEABOVE", (0, 0), (0, 0), 2.4, accent),
+            ("TOPPADDING", (0, 0), (0, 0), 4),
+        ]))
+        return inner
+
+    # ------------------------------------------------------------------ #
+    #  Build the story                                                   #
+    # ------------------------------------------------------------------ #
+    elements = []
     images_failed = False
-    chart_imgs = []
-    if include_images:
-        for title in chart_titles:
-            png = chart_pngs.get(title)
-            if png is not None:
-                chart_imgs.append((title, png))
-            else:
-                images_failed = True
+    team_overview_rendered = False
+    individual_breakdown_rendered = False
+    summary_table_rendered = False
 
-    elements.append(Paragraph("Team Overview", h2_style))
+    # Leave room below the printed header band on page 1.
+    elements.append(Spacer(1, 15 * mm))
 
-    if chart_imgs:
-        # Normal path: charts rendered fine, show them as images.
-        row_imgs = []
-        for i, (title, png) in enumerate(chart_imgs):
-            img = RLImage(io.BytesIO(png), width=370, height=213)
-            cell = [Paragraph(title, ParagraphStyle("ct", fontSize=9, textColor=rl_colors.HexColor("#0F1729"))), img]
-            row_imgs.append(cell)
-            if len(row_imgs) == 2:
-                t = Table([row_imgs], colWidths=[390, 390])
-                t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
-                elements.append(t)
-                elements.append(Spacer(1, 8))
-                row_imgs = []
-        if row_imgs:
-            t = Table([row_imgs], colWidths=[390] * len(row_imgs))
-            t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
-            elements.append(t)
-    else:
-        # Fallback path: no images available for any reason (kaleido disabled,
-        # unavailable, or every render failed). Never leave a near-empty page —
-        # show the same information as real numbers instead of an image.
+    # ---- KPI tile strip (always shown) ----
+    tile_specs = [
+        ("QA TEAM SIZE", f'{kpis["team_size"]}', "active members", C_INK),
+        ("TOTAL HOURS", f'{kpis["total"]:,.1f}', "hrs this period", C_INK2),
+        ("BILLABLE HOURS", f'{kpis["billable"]:,.1f}', "hrs logged", C_BILL),
+        ("NON-BILLABLE", f'{kpis["nonbill"]:,.1f}', "hrs logged", C_NONBILL),
+        ("UTILIZATION", f'{kpis["utilization"]:.1f}%', "billable share", C_NOTWORKED),
+    ]
+    # 5 real tiles + 1 spacer keeps them the same width as the 6-col grid used
+    # elsewhere; instead just spread 5 evenly across the full width.
+    tile_w = CONTENT_W / 5.0
+    tile_cells = [_kpi_tile(*spec) for spec in tile_specs]
+    kpi_strip = Table([tile_cells], colWidths=[tile_w] * 5)
+    kpi_strip.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, -1), C_WHITE),
+        ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.8, C_BORDER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+    ]))
+    elements.append(kpi_strip)
+    elements.append(Spacer(1, 12))
+
+    # ================================================================== #
+    #  SECTION 1 — TEAM OVERVIEW                                          #
+    # ================================================================== #
+    if show_team_overview:
+        # Collect the rendered chart PNGs by title up front.
+        chart_by_title = {}
+        if include_images:
+            for title in chart_titles:
+                png = chart_pngs.get(title)
+                if png is not None:
+                    chart_by_title[title] = png
+                else:
+                    images_failed = True
+
+        donut_title = next((t for t in chart_titles if "Donut" in t or "Utilization" in t), None)
+        bar_title = next((t for t in chart_titles if "Comparison" in t or "Total Hours" in t), None)
+        mix_title = next((t for t in chart_titles if "Mix" in t), None)
+
+        # ---- Derived figures for the insight panel -----------------------
+        bill = float(kpis.get("billable", 0) or 0)
+        non = float(kpis.get("nonbill", 0) or 0)
+        tot = float(kpis.get("total", 0) or 0)
+        notw = max(0.0, tot - bill - non)
+        denom = tot if tot > 0 else 1.0
+        bill_pct, non_pct, notw_pct = bill / denom * 100, non / denom * 100, notw / denom * 100
+
+        sorted_summary = summary_df.sort_values("Total Hours", ascending=False)
+        top_name = sorted_summary.iloc[0]["QA Name"] if len(sorted_summary) else "\u2014"
+        top_hours = float(sorted_summary.iloc[0]["Total Hours"]) if len(sorted_summary) else 0.0
+        team_n = int(kpis.get("team_size", len(summary_df)) or len(summary_df))
+        avg_per_qa = (tot / team_n) if team_n else 0.0
+
+        # =============================================================== #
+        #  PAGE 1 — Team utilization donut + breakdown insight panel      #
+        # =============================================================== #
+        elements.append(Paragraph("Team Overview", st_section))
         elements.append(Paragraph(
-            "Chart images could not be rendered in this environment (kaleido/Chrome "
-            "unavailable). The figures below are the same data the on-screen charts "
-            "show, presented as tables instead.",
-            sub_style))
+            "How the team's logged hours split across billable, non-billable, and not-worked.",
+            st_section_sub))
+        elements.append(HRule(CONTENT_W))
+        elements.append(Spacer(1, 14))
+
+        # ---- Left: donut card ----
+        if donut_title and donut_title in chart_by_title:
+            donut_body = RLImage(io.BytesIO(chart_by_title[donut_title]), width=286, height=250)
+        else:
+            donut_body = Paragraph(
+                f"<b>{kpis.get('utilization', 0):.1f}%</b> utilization",
+                _p("dnu", fontSize=13, leading=16, textColor=C_INK, alignment=TA_CENTER))
+        left_card = Table(
+            [[Paragraph("Team Utilization Split", st_chart_cap)], [donut_body]],
+            colWidths=[338])
+        left_card.setStyle(TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BACKGROUND", (0, 0), (-1, -1), C_WHITE),
+            ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+            ("ROUNDEDCORNERS", [8, 8, 8, 8]),
+            ("TOPPADDING", (0, 0), (0, 0), 12),
+            ("BOTTOMPADDING", (0, 0), (0, 0), 4),
+            ("TOPPADDING", (0, 1), (0, 1), 2),
+            ("BOTTOMPADDING", (0, 1), (0, 1), 14),
+        ]))
+
+        # ---- Right: "Utilization Breakdown" insight panel ----
+        meter_w = 360
+
+        def _breakdown_row(color, label, hours, pct):
+            head = Table(
+                [[Paragraph(f'<font color="{color}">&#9632;</font> &nbsp;<b>{label}</b>',
+                            _p("brl", fontSize=10.5, leading=13, textColor=C_TEXT)),
+                  Paragraph(f'<b>{hours:,.1f}</b> hrs &nbsp;&middot;&nbsp; {pct:.1f}%',
+                            _p("brv", fontSize=10.5, leading=13, textColor=C_MUTED, alignment=TA_RIGHT))]],
+                colWidths=[meter_w * 0.5, meter_w * 0.5])
+            head.setStyle(TableStyle([
+                ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]))
+            return [head, Spacer(1, 2),
+                    BarMeter(meter_w, pct / 100.0, rl_colors.HexColor(color)),
+                    Spacer(1, 12)]
+
+        panel_flow = [Paragraph("Utilization Breakdown", _p(
+            "bdh", fontSize=12, leading=15, textColor=C_INK, fontName="Helvetica-Bold"))]
+        panel_flow.append(Spacer(1, 12))
+        panel_flow += _breakdown_row("#2F9E8F", "Billable", bill, bill_pct)
+        panel_flow += _breakdown_row("#E0A72E", "Non-Billable", non, non_pct)
+        panel_flow += _breakdown_row("#C1543D", "Not Worked", notw, notw_pct)
+        panel_flow.append(HRule(meter_w))
+        panel_flow.append(Spacer(1, 10))
+
+        highlight = Table([
+            [Paragraph("HIGHEST TOTAL", _p("hk", fontSize=7.5, leading=10, textColor=C_MUTED,
+                                          fontName="Helvetica-Bold")),
+             Paragraph("AVG PER QA", _p("hk2", fontSize=7.5, leading=10, textColor=C_MUTED,
+                                        fontName="Helvetica-Bold"))],
+            [Paragraph(f"<b>{top_name}</b>", _p("hv", fontSize=11, leading=14, textColor=C_INK)),
+             Paragraph(f"<b>{avg_per_qa:,.1f}</b> hrs", _p("hv2", fontSize=11, leading=14, textColor=C_INK))],
+            [Paragraph(f"{top_hours:,.1f} hrs", _p("hs", fontSize=8.5, leading=11, textColor=C_MUTED)),
+             Paragraph(f"across {team_n} QAs", _p("hs2", fontSize=8.5, leading=11, textColor=C_MUTED))],
+        ], colWidths=[meter_w * 0.5, meter_w * 0.5])
+        highlight.setStyle(TableStyle([
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        panel_flow.append(highlight)
+
+        right_card = Table([[panel_flow]], colWidths=[398])
+        right_card.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BACKGROUND", (0, 0), (-1, -1), C_WHITE),
+            ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+            ("ROUNDEDCORNERS", [8, 8, 8, 8]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 20),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 20),
+            ("TOPPADDING", (0, 0), (-1, -1), 16),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 16),
+        ]))
+
+        page1_row = Table([[left_card, right_card]], colWidths=[346, 406])
+        page1_row.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (0, 0), 8),
+            ("RIGHTPADDING", (1, 0), (1, 0), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        elements.append(page1_row)
+
+        # =============================================================== #
+        #  PAGE 2 — QA comparison + hours mix, each a full-width card      #
+        # =============================================================== #
+        have_team_charts = (bar_title in chart_by_title) or (mix_title in chart_by_title)
+        if have_team_charts:
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 2))
+            elements.append(Paragraph("Team Charts", st_section))
+            elements.append(Paragraph(
+                "Total hours per QA, and each person's billable / non-billable / not-worked mix.",
+                st_section_sub))
+            elements.append(HRule(CONTENT_W))
+            elements.append(Spacer(1, 12))
+
+            def _wide_chart_card(title_text, png, img_h):
+                body = RLImage(io.BytesIO(png), width=CONTENT_W - 44, height=img_h)
+                card = Table([[Paragraph(title_text, st_chart_cap)], [body]],
+                             colWidths=[CONTENT_W])
+                card.setStyle(TableStyle([
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("BACKGROUND", (0, 0), (-1, -1), C_WHITE),
+                    ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+                    ("ROUNDEDCORNERS", [8, 8, 8, 8]),
+                    ("TOPPADDING", (0, 0), (0, 0), 10),
+                    ("BOTTOMPADDING", (0, 0), (0, 0), 3),
+                    ("TOPPADDING", (0, 1), (0, 1), 2),
+                    ("BOTTOMPADDING", (0, 1), (0, 1), 10),
+                ]))
+                # KeepTogether so a card's title never separates from its chart
+                # across a page break (that was leaving an orphaned heading).
+                return KeepTogether([card])
+
+            if bar_title in chart_by_title:
+                elements.append(_wide_chart_card("QA Comparison — Total Hours",
+                                                 chart_by_title[bar_title], 167))
+                elements.append(Spacer(1, 12))
+            if mix_title in chart_by_title:
+                elements.append(_wide_chart_card("Hours Mix — Billable / Non-Billable / Not Worked",
+                                                 chart_by_title[mix_title], 176))
+
+        # ---- Fallback when NO chart images are available at all ----------
+        if not chart_by_title:
+            elements.append(Spacer(1, 10))
+            elements.append(Paragraph(
+                "Chart images could not be rendered for this export. The figures "
+                "below are the same data the on-screen charts show, as tables.",
+                st_note))
+            elements.append(Spacer(1, 8))
+            comp_df = summary_df[["QA Name", "Total Hours"]].sort_values("Total Hours", ascending=False)
+            mix_df = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked"]]
+            comp_data = [["QA Name", "Total Hours"]] + comp_df.round(1).astype(str).values.tolist()
+            comp_tbl = Table(comp_data, colWidths=[240, 130])
+            mix_data = [["QA Name", "Billable", "Non-Billable", "Not Worked"]] + mix_df.round(1).astype(str).values.tolist()
+            mix_tbl = Table(mix_data, colWidths=[150, 80, 90, 80])
+            for tbl in (comp_tbl, mix_tbl):
+                tbl.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), C_INK),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), C_WHITE),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("GRID", (0, 0), (-1, -1), 0.4, C_BORDER),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [C_WHITE, C_PAGE]),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]))
+            side = Table([[
+                Table([[Paragraph("QA Comparison — Total Hours", st_chart_cap)], [comp_tbl]]),
+                Table([[Paragraph("Hours Mix", st_chart_cap)], [mix_tbl]]),
+            ]], colWidths=[380, 400])
+            side.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+            elements.append(side)
+
+        team_overview_rendered = True
+
+    # ================================================================== #
+    #  SECTION 2 — INDIVIDUAL QA BREAKDOWN                                #
+    # ================================================================== #
+    if show_individual_breakdown:
+        if team_overview_rendered:
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 2))
+        elements.append(Paragraph("Individual QA Breakdown", st_section))
+        elements.append(Paragraph(
+            "Center figure = each QA's Billable Hours ÷ Total Hours (their own billable share) for the period.",
+            st_section_sub))
+        elements.append(HRule(CONTENT_W))
+        elements.append(Spacer(1, 10))
+
+        # Adaptive grid so the donuts fill the page regardless of team size.
+        n = len(qa_names)
+        per_row = 4 if n > 3 else max(1, n)
+        if n <= 4:
+            img_size = 168
+        elif n <= 8:
+            img_size = 150
+        else:
+            img_size = 128
+        col_w = CONTENT_W / per_row
+
+        # Build one "card" flowable per QA (name + donut, boxed).
+        def _qa_card(qa_name):
+            img = None
+            if include_images:
+                png = mini_pngs.get(qa_name)
+                if png is not None:
+                    img = RLImage(io.BytesIO(png), width=img_size, height=img_size)
+            body = img if img is not None else Paragraph(
+                "(image<br/>unavailable)", _p("nu", fontSize=8, leading=10,
+                                              textColor=C_MUTED, alignment=TA_CENTER))
+            card = Table([[Paragraph(qa_name, st_qa_name)], [body]],
+                         colWidths=[col_w - 10])
+            card.setStyle(TableStyle([
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BACKGROUND", (0, 0), (-1, -1), C_WHITE),
+                ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+                ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+                ("TOPPADDING", (0, 0), (0, 0), 7),
+                ("BOTTOMPADDING", (0, 0), (0, 0), 2),
+                ("TOPPADDING", (0, 1), (0, 1), 0),
+                ("BOTTOMPADDING", (0, 1), (0, 1), 7),
+            ]))
+            return card
+
+        any_mini_image = include_images and any(mini_pngs.get(q) is not None for q in qa_names)
+        if include_images and not any_mini_image:
+            images_failed = True
+
+        # Assemble rows of cards.
+        cards = [_qa_card(q) for q in qa_names]
+        row = []
+        grid_rows = []
+        for c in cards:
+            row.append(c)
+            if len(row) == per_row:
+                grid_rows.append(row)
+                row = []
+        if row:
+            while len(row) < per_row:  # pad the last row so widths stay even
+                row.append(Paragraph("", styles["Normal"]))
+            grid_rows.append(row)
+
+        if grid_rows:
+            grid = Table(grid_rows, colWidths=[col_w] * per_row)
+            grid.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            elements.append(grid)
+
+        if not any_mini_image:
+            elements.append(Spacer(1, 12))
+            elements.append(Paragraph(
+                "Donut images could not be rendered in this environment. Per-QA "
+                "utilization (the number the donuts show) is in the table below.",
+                st_note))
+            elements.append(Spacer(1, 6))
+            util_df = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours",
+                                   "Hours Not Worked", "Total Hours", "Utilization %"]]
+            util_data = [["QA Name", "Billable", "Non-Billable", "Not Worked", "Total", "Utilization %"]]
+            for r in util_df.round(1).values.tolist():
+                util_data.append([r[0], f"{r[1]:.1f}", f"{r[2]:.1f}", f"{r[3]:.1f}", f"{r[4]:.1f}", f"{r[5]:.1f}%"])
+            n_c = 6
+            util_tbl = Table(util_data, colWidths=[CONTENT_W / n_c] * n_c, repeatRows=1)
+            util_tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), C_INK),
+                ("TEXTCOLOR", (0, 0), (-1, 0), C_WHITE),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.4, C_BORDER),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [C_WHITE, C_PAGE]),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            elements.append(util_tbl)
+
+        individual_breakdown_rendered = True
+
+    # ================================================================== #
+    #  SECTION 3 — PER-QA SUMMARY TABLE                                   #
+    # ================================================================== #
+    if show_summary_table:
+        if team_overview_rendered or individual_breakdown_rendered:
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 2))
+        elements.append(Paragraph("Per-QA Summary Table", st_section))
+        elements.append(Paragraph(
+            "Aggregated hours and utilization per QA for the selected period.",
+            st_section_sub))
+        elements.append(HRule(CONTENT_W))
+        elements.append(Spacer(1, 10))
+
+        cols = list(summary_df.columns)
+        n_cols = len(cols)
+        header = [Paragraph(f"<b>{c}</b>", _p("th", fontSize=10, leading=12,
+                            textColor=C_WHITE, alignment=TA_CENTER)) for c in cols]
+        body_rows = summary_df.round(1).astype(str).values.tolist()
+        table_data = [header] + body_rows
+
+        col_w = CONTENT_W / n_cols
+        per_qa_tbl = Table(table_data, colWidths=[col_w] * n_cols, repeatRows=1)
+
+        # Taller, generously padded rows so the table reads as a designed
+        # report table filling the page rather than a small dense grid.
+        n_body = len(body_rows)
+        row_pad = 10 if n_body <= 10 else (7 if n_body <= 18 else 5)
+        per_qa_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_INK),
+            ("TEXTCOLOR", (0, 0), (-1, 0), C_WHITE),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("TEXTCOLOR", (0, 1), (-1, -1), C_TEXT),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("LINEBEFORE", (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("LINEAFTER", (-1, 0), (-1, -1), 0.5, C_BORDER),
+            ("LINEABOVE", (0, 0), (-1, 0), 0.5, C_INK),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [C_WHITE, rl_colors.HexColor("#F7F8FB")]),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), row_pad),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), row_pad),
+            ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+        ]))
+        elements.append(per_qa_tbl)
+        summary_table_rendered = True
+
+    # ================================================================== #
+    #  SECTION 4 — DAILY LOG (unchanged behavior, restyled header)       #
+    # ================================================================== #
+    if show_daily_log:
+        if team_overview_rendered or individual_breakdown_rendered or summary_table_rendered:
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 2))
+        elements.append(Paragraph("Daily Log", st_section))
+        elements.append(Paragraph(
+            f"{len(detail_df):,} rows · sorted by date, most recent first.",
+            st_section_sub))
+        elements.append(HRule(CONTENT_W))
         elements.append(Spacer(1, 8))
 
-        elements.append(Paragraph("QA Comparison &mdash; Total Hours", ParagraphStyle(
-            "h3a", fontSize=11, textColor=rl_colors.HexColor("#0F1729"), spaceBefore=4, spaceAfter=4)))
-        comp_df = summary_df[["QA Name", "Total Hours"]].sort_values("Total Hours", ascending=False)
-        comp_data = [["QA Name", "Total Hours"]] + comp_df.round(1).astype(str).values.tolist()
-        comp_tbl = Table(comp_data, colWidths=[250, 150])
-        comp_tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+        log_for_pdf = detail_df.copy().sort_values("Date", ascending=False)
+        log_for_pdf["Date"] = pd.to_datetime(log_for_pdf["Date"]).dt.strftime("%Y-%m-%d")
+        log_cols = ["Date", "Day", "QA Name", "Billable Hours", "Non-Billable Hours",
+                    "Hours Not Worked", "Total Hours", "Comment"]
+        log_for_pdf = log_for_pdf[log_cols]
+
+        MAX_PDF_LOG_ROWS = 500
+        truncated = len(log_for_pdf) > MAX_PDF_LOG_ROWS
+        log_for_pdf_show = log_for_pdf.head(MAX_PDF_LOG_ROWS)
+
+        log_table_data = [log_cols] + log_for_pdf_show.round(2).astype(str).values.tolist()
+        log_col_widths = [64, 38, 92, 66, 78, 72, 66, 297]
+        log_tbl = Table(log_table_data, colWidths=log_col_widths, repeatRows=1)
+        log_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_INK),
+            ("TEXTCOLOR", (0, 0), (-1, 0), C_WHITE),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("GRID", (0, 0), (-1, -1), 0.4, C_BORDER),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [C_WHITE, C_PAGE]),
+            ("ALIGN", (0, 0), (6, -1), "CENTER"),
+            ("ALIGN", (7, 0), (7, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ]))
-        elements.append(comp_tbl)
-        elements.append(Spacer(1, 14))
-
-        elements.append(Paragraph("Hours Mix &mdash; Billable / Non-Billable / Not Worked", ParagraphStyle(
-            "h3b", fontSize=11, textColor=rl_colors.HexColor("#0F1729"), spaceBefore=4, spaceAfter=4)))
-        mix_df = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked"]]
-        mix_data = [["QA Name", "Billable", "Non-Billable", "Not Worked"]] + mix_df.round(1).astype(str).values.tolist()
-        mix_tbl = Table(mix_data, colWidths=[220, 120, 120, 120])
-        mix_tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
-        elements.append(mix_tbl)
-        elements.append(Spacer(1, 14))
-
-        elements.append(Paragraph("Team Utilization Split", ParagraphStyle(
-            "h3c", fontSize=11, textColor=rl_colors.HexColor("#0F1729"), spaceBefore=4, spaceAfter=4)))
-        elements.append(Paragraph(
-            f"Billable: {kpis['billable']:.1f} hrs &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"Non-Billable: {kpis['nonbill']:.1f} hrs &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"Utilization: {kpis['utilization']:.1f}%",
-            sub_style))
-
-    # Only force a fresh page here when there are real chart images that need
-    # the room -- confirmed by direct visual inspection that forcing a page
-    # break in the image-less fallback path left 60-85% of the page blank,
-    # since the fallback content (a couple of small tables) is far shorter
-    # than an embedded chart image. Letting ReportLab's natural flow pack
-    # sections together in the fallback case avoids that wasted space.
-    if include_images:
-        elements.append(PageBreak())
-    elements.append(Paragraph("Individual QA Breakdown", h2_style))
-
-    mini_row = []
-    any_mini_image = False
-    for i, qa_name in enumerate(qa_names):
-        img = None
-        if include_images:
-            png = mini_pngs.get(qa_name)
-            if png is not None:
-                img = RLImage(io.BytesIO(png), width=110, height=110)
-                any_mini_image = True
-            else:
-                images_failed = True
-        if img is None:
-            img = Paragraph("", styles["Normal"])
-        cell = [Paragraph(f"<b>{qa_name}</b>", ParagraphStyle("qn", fontSize=9,
-                           textColor=rl_colors.HexColor("#0F1729"), alignment=1)), img]
-        mini_row.append(cell)
-        if len(mini_row) == 5:
-            t = Table([mini_row], colWidths=[156] * 5)
-            t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
-            elements.append(t)
+        elements.append(log_tbl)
+        if truncated:
             elements.append(Spacer(1, 6))
-            mini_row = []
-    if mini_row:
-        t = Table([mini_row], colWidths=[156] * len(mini_row))
-        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
-        elements.append(t)
+            elements.append(Paragraph(
+                f"Showing the most recent {MAX_PDF_LOG_ROWS:,} of {len(log_for_pdf):,} rows. "
+                "Download the Excel export for the complete daily log.",
+                st_note))
 
-    if not any_mini_image:
-        # No per-QA donut images either — replace the mostly-empty name grid
-        # with the real per-QA utilization numbers instead.
-        elements.append(Spacer(1, 10))
+    if not any([show_team_overview, show_individual_breakdown, show_summary_table, show_daily_log]):
         elements.append(Paragraph(
-            "Donut images could not be rendered in this environment. Per-QA "
-            "utilization (the number the donuts show) is below:",
-            sub_style))
-        elements.append(Spacer(1, 6))
-        util_df = summary_df[["QA Name", "Billable Hours", "Non-Billable Hours",
-                               "Hours Not Worked", "Total Hours", "Utilization %"]]
-        util_data = [["QA Name", "Billable", "Non-Billable", "Not Worked", "Total", "Utilization %"]] + \
-                    util_df.round(1).astype(str).values.tolist()
-        util_tbl = Table(util_data, colWidths=[170, 100, 110, 100, 90, 110])
-        util_tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
-        elements.append(util_tbl)
+            "No report sections were selected for this export. Check at least one of "
+            "Team Overview, Individual QA Breakdown, Per-QA Summary Table, or Daily Log "
+            "in the Export panel and click Prepare Exports again.",
+            st_note))
 
-    # Same reasoning as above: only force a page break here if the section
-    # just rendered actually used real images (any_mini_image is more precise
-    # than the general include_images flag, since individual mini-donut
-    # renders can fail even when include_images is True overall).
-    if any_mini_image:
-        elements.append(PageBreak())
-
-    per_qa_table_data = [list(summary_df.columns)] + summary_df.round(1).astype(str).values.tolist()
-    n_cols = len(summary_df.columns)
-    col_width = 780 / n_cols
-    per_qa_tbl = Table(per_qa_table_data, colWidths=[col_width] * n_cols, repeatRows=1)
-    per_qa_tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    elements.append(KeepTogether([
-        Paragraph("Per-QA Summary Table", h2_style),
-        Spacer(1, 4),
-        per_qa_tbl,
-    ]))
-
-    # ---- Daily Log (mirrors the on-screen Daily Log table) ----
-    # Same reasoning as the two page breaks above, corrected after actually
-    # rendering and inspecting the output: in the no-images fallback case the
-    # Per-QA Summary Table is short enough to leave real room on its page, so
-    # forcing a break here left that page mostly blank too. Conditional on
-    # include_images lets Daily Log flow naturally in the fallback case.
-    if include_images:
-        elements.append(PageBreak())
-    elements.append(Paragraph("Daily Log", h2_style))
-    elements.append(Paragraph(
-        f"{len(detail_df):,} rows &middot; sorted by date, most recent first",
-        sub_style))
-    elements.append(Spacer(1, 4))
-
-    log_for_pdf = detail_df.copy().sort_values("Date", ascending=False)
-    log_for_pdf["Date"] = pd.to_datetime(log_for_pdf["Date"]).dt.strftime("%Y-%m-%d")
-    log_cols = ["Date", "Day", "QA Name", "Billable Hours", "Non-Billable Hours",
-                "Hours Not Worked", "Total Hours", "Comment"]
-    log_for_pdf = log_for_pdf[log_cols]
-
-    # Cap rows rendered directly in the PDF table for file-size/perf sanity;
-    # the full, uncapped data is always in the companion Excel export.
-    MAX_PDF_LOG_ROWS = 500
-    truncated = len(log_for_pdf) > MAX_PDF_LOG_ROWS
-    log_for_pdf_show = log_for_pdf.head(MAX_PDF_LOG_ROWS)
-
-    log_table_data = [log_cols] + log_for_pdf_show.round(2).astype(str).values.tolist()
-    log_col_widths = [70, 40, 90, 65, 75, 70, 65, 300]
-    log_tbl = Table(log_table_data, colWidths=log_col_widths, repeatRows=1)
-    log_tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0F1729")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#E7E9F0")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F4F5F8")]),
-        ("ALIGN", (0, 0), (6, -1), "CENTER"),
-        ("ALIGN", (7, 0), (7, -1), "LEFT"),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    elements.append(log_tbl)
-    if truncated:
-        elements.append(Spacer(1, 6))
-        elements.append(Paragraph(
-            f"Showing the most recent {MAX_PDF_LOG_ROWS:,} of {len(log_for_pdf):,} rows. "
-            "Download the Excel export for the complete daily log.",
-            sub_style))
-
-    doc.build(elements)
+    # First page gets the printed header band; every page gets the footer.
+    doc.build(elements, onFirstPage=_first_page, onLaterPages=_draw_footer)
     buf.seek(0)
     return buf, images_failed
 
@@ -1404,6 +2015,14 @@ with st.expander("\U0001F4CB View Per-QA Summary Table"):
         qa_summary[["QA Name", "Billable Hours", "Non-Billable Hours", "Hours Not Worked",
                      "Total Hours", "Utilization %", "Days Logged"]].round(1),
         use_container_width=True, hide_index=True,
+        column_config={
+            # "%.1f%%" -> one decimal place followed by a literal "%" sign,
+            # e.g. 53.7 -> "53.7%". This only changes how the number is
+            # DISPLAYED in this on-screen table; the underlying value stays a
+            # plain float, so it still sorts numerically when the user clicks
+            # the column header.
+            "Utilization %": st.column_config.NumberColumn("Utilization %", format="%.1f%%"),
+        },
     )
 
 # ============================================================================
@@ -1420,6 +2039,43 @@ export_summary = qa_summary[["QA Name", "Billable Hours", "Non-Billable Hours", 
 export_detail = df_period[["QA Name", "Date", "Day", "Month", "Billable Hours",
                             "Non-Billable Hours", "Hours Not Worked", "Total Hours", "Comment"]].sort_values(["QA Name", "Date"])
 
+# ---- PDF section toggles -------------------------------------------------
+# These checkboxes control ONLY the PDF export -- the Excel export always
+# contains every section (Dashboard sheet with the Team Overview charts +
+# Individual QA Breakdown images, QA Summary sheet, Detail Data sheet)
+# regardless of what's checked here, since to_excel_bytes doesn't take a
+# sections argument at all. "Team Overview", "Individual QA Breakdown", and
+# "Per-QA Summary Table" default to checked (ON); "Daily Log" defaults to
+# UNCHECKED so a Prepare Exports click doesn't produce a long log table in
+# the PDF unless the person explicitly opts in.
+st.markdown('<div class="panel-sub" style="margin-top:8px; margin-bottom:4px;"><b>PDF sections</b> \u2014 choose what to include in the PDF. The Excel export always contains every section regardless of these checkboxes.</div>', unsafe_allow_html=True)
+
+if "pdf_section_team_overview" not in st.session_state:
+    st.session_state["pdf_section_team_overview"] = True
+if "pdf_section_individual_breakdown" not in st.session_state:
+    st.session_state["pdf_section_individual_breakdown"] = True
+if "pdf_section_summary_table" not in st.session_state:
+    st.session_state["pdf_section_summary_table"] = True
+if "pdf_section_daily_log" not in st.session_state:
+    st.session_state["pdf_section_daily_log"] = False  # OFF by default, per requirement
+
+cb1, cb2, cb3, cb4 = st.columns(4)
+with cb1:
+    pdf_include_team_overview = st.checkbox("Team Overview", key="pdf_section_team_overview")
+with cb2:
+    pdf_include_individual_breakdown = st.checkbox("Individual QA Breakdown", key="pdf_section_individual_breakdown")
+with cb3:
+    pdf_include_summary_table = st.checkbox("Per-QA Summary Table", key="pdf_section_summary_table")
+with cb4:
+    pdf_include_daily_log = st.checkbox("Daily Log", key="pdf_section_daily_log")
+
+pdf_sections = {
+    "Team Overview": pdf_include_team_overview,
+    "Individual QA Breakdown": pdf_include_individual_breakdown,
+    "Per-QA Summary Table": pdf_include_summary_table,
+    "Daily Log": pdf_include_daily_log,
+}
+
 prepare_clicked = st.button("\u2699\ufe0f Prepare Exports", type="primary", use_container_width=False)
 
 if prepare_clicked:
@@ -1428,61 +2084,29 @@ if prepare_clicked:
 if st.session_state.get("_run_export_build"):
     st.session_state["_run_export_build"] = False
 
-    if "_kaleido_check_cache" in st.session_state:
-        # Already probed once this session -- reuse that result instead of
-        # spending another up-to-KALEIDO_TIMEOUT_SECONDS on a question we
-        # already have the answer to. This is invalidated (see the Chrome
-        # install button below) whenever there's a real reason the answer
-        # might have changed.
-        kaleido_ok, kaleido_msg, chrome_missing = st.session_state["_kaleido_check_cache"]
-    else:
-        with st.spinner(f"Checking chart rendering (up to {KALEIDO_PROBE_TIMEOUT_SECONDS}s, once per session)..."):
-            kaleido_ok, kaleido_msg, chrome_missing = _check_kaleido_available()
-        st.session_state["_kaleido_check_cache"] = (kaleido_ok, kaleido_msg, chrome_missing)
-
-    if not kaleido_ok:
-        st.warning(
-            f"{kaleido_msg}\n\n"
-            "Proceeding to build the Excel and PDF **without chart images** — "
-            "all KPI numbers, the per-QA summary table, and the full Daily Log "
-            "will still be complete."
-        )
-        if chrome_missing:
-            if st.button("\U0001F310 Install Chrome for Exports (one-time, ~100MB)"):
-                try:
-                    import plotly.io as pio
-                    with st.spinner("Downloading Chrome for chart rendering \u2014 this can take a minute..."):
-                        _run_with_timeout(pio.get_chrome, 120)
-                    st.success("Chrome installed. Building your exports now...")
-                    st.session_state.pop("_kaleido_check_cache", None)
-                    st.session_state["_run_export_build"] = True
-                    st.rerun()
-                except Exception as install_err:
-                    st.error(
-                        f"Automatic Chrome install failed: {install_err}\n\n"
-                        "Please install Chrome manually from google.com/chrome, "
-                        "then restart the Streamlit app and click Prepare Exports again."
-                    )
-
+    # Export charts are rendered with matplotlib (see build_export_chart_pngs),
+    # which has no Chrome/Chromium/kaleido dependency — it always works, on a
+    # laptop, a server, or a frozen .exe. So there is no viability probe and no
+    # "install Chrome" step anymore; images_ok is simply True unless an
+    # individual figure raises (each is guarded, and any that fails just falls
+    # back to that section's data table).
+    images_ok = True
     chart_pngs = {}
     mini_pngs = {}
-    if kaleido_ok:
-        with st.spinner("Rendering charts (once, shared by both Excel and PDF)..."):
-            # Render at the LARGER of the two destinations' needs (Excel's
-            # 560x311 / 220x220 vs PDF's 555x320 / 165x165) -- the same PNG
-            # then gets displayed slightly smaller in the PDF, which is safe
-            # downscaling with no visible quality loss, and means each figure
-            # is rendered exactly once instead of once per export format.
-            for title, fig in team_chart_figs:
-                try:
-                    chart_pngs[title] = _fig_to_png_bytes(fig, width=560, height=311)
-                except Exception:
-                    pass  # left out of the dict; both builders already handle a missing entry
-            for qa_name, fig in qa_mini_figs:
-                try:
-                    mini_pngs[qa_name] = _fig_to_png_bytes(fig, width=220, height=220)
-                except Exception:
-                    pass
+    with st.spinner("Rendering charts for the exports..."):
+        try:
+            chart_titles_for_render = [title for title, _ in team_chart_figs]
+            qa_names_for_render = [qa_name for qa_name, _ in qa_mini_figs]
+            chart_pngs, mini_pngs = build_export_chart_pngs(
+                export_summary, billable_total, nonbill_total, notworked_total,
+                chart_titles_for_render, qa_names_for_render)
+        except Exception as render_err:
+            images_ok = False
+            st.warning(
+                f"Chart images could not be rendered ({render_err}). Proceeding "
+                "to build the Excel and PDF **without chart images** — all KPI "
+                "numbers and every selected section will still be complete."
+            )
 
     try:
         with st.spinner("Building Excel and PDF reports..."):
@@ -1491,21 +2115,21 @@ if st.session_state.get("_run_export_build"):
             excel_buf, excel_images_failed = to_excel_bytes(
                 export_summary, export_detail, kpis, period_label,
                 chart_titles, chart_pngs, qa_names_for_export, mini_pngs,
-                include_images=kaleido_ok)
+                include_images=images_ok)
             pdf_buf, pdf_images_failed = to_pdf_bytes(
                 export_summary, export_detail, kpis, period_label,
                 chart_titles, chart_pngs, qa_names_for_export, mini_pngs,
-                include_images=kaleido_ok)
+                include_images=images_ok, sections=pdf_sections)
             st.session_state["export_excel_bytes"] = excel_buf
             st.session_state["export_pdf_bytes"] = pdf_buf
             st.session_state["export_period_label"] = period_label
             st.session_state["export_filename_base"] = _build_export_filename_base(period_label, sel_qas, all_qas)
             st.session_state["export_generated_at"] = datetime.now().strftime("%d %b %Y, %H:%M:%S")
 
-        if kaleido_ok and not excel_images_failed and not pdf_images_failed:
+        if images_ok and not excel_images_failed and not pdf_images_failed:
             st.success("Exports ready below, with all charts included \u2014 changing filters now will NOT regenerate them until you click Prepare Exports again.")
         else:
-            st.info("Exports ready below \u2014 data-complete, but some chart images could not be rendered (see warning above). Changing filters now will NOT regenerate them until you click Prepare Exports again.")
+            st.info("Exports ready below \u2014 data-complete, but some chart images could not be rendered. Changing filters now will NOT regenerate them until you click Prepare Exports again.")
     except Exception as e:
         st.error(f"Export generation failed: {e}")
         st.session_state.pop("export_excel_bytes", None)
@@ -1535,5 +2159,3 @@ if "export_excel_bytes" in st.session_state:
             mime="application/pdf",
             use_container_width=True,
         )
-
-st.caption("Built for QA Management \u00b7 Streamlit Dashboard \u00b7 Ready for desktop packaging (Windows/Mac)")
