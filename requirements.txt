@@ -9,5 +9,16 @@ plotly>=6.1.1
 # working fully offline. (kaleido 1.x needed a system Chrome; kaleido 0.2.1's
 # bundled Chromium hangs on some machines — matplotlib avoids both problems.)
 matplotlib>=3.7
+# Pillow reads each rendered chart's real pixel dimensions so PDF/Excel
+# placements can preserve the true aspect ratio instead of a guessed one.
+# It's already a transitive dependency of reportlab/openpyxl, but pinning it
+# directly here makes sure PyInstaller sees and bundles it for the .exe.
+Pillow>=10.0
+# fonttools reads each embedded CJK font's glyph coverage (which Unicode
+# characters it actually has) so Korean/Japanese Daily Log comments render
+# with a font that has the right glyphs instead of missing-glyph boxes. It's
+# already a transitive dependency of matplotlib, but pinned here directly for
+# the same PyInstaller-visibility reason as Pillow above.
+fonttools>=4.40
 openpyxl>=3.1
 reportlab>=4.2

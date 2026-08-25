@@ -12,7 +12,9 @@ Run:  streamlit run app.py
 """
 
 import io
+import os
 import re
+import sys
 import warnings
 from datetime import datetime, date
 
@@ -274,11 +276,30 @@ def _to_number(x):
         return np.nan
 
 
-def parse_workbook(file) -> pd.DataFrame:
-    """Read every per-QA sheet in the workbook and return one tidy dataframe.
-    Rows dated after today are dropped, even if present in the source file."""
+def parse_workbook(file):
+    """Read every per-QA sheet in the workbook and return one tidy dataframe,
+    plus a small diagnostics dict about data-quality issues found while
+    parsing. Rows dated after today are dropped, even if present in the
+    source file.
+
+    Returns (df: pd.DataFrame, diagnostics: dict) where diagnostics has:
+      - "total_mismatch_rows": count of rows where the SHEET's own Total
+        Hours value disagreed with Billable + Non-Billable + Hours Not
+        Worked (before this function overwrites it -- see below).
+      - "total_mismatch_hours": sum of |sheet total - computed total| across
+        those rows, i.e. how many hours of drift this represents.
+      - "implausible_rows": up to 15 (QA Name, Date, Total Hours) tuples
+        where the FINAL (corrected) Total Hours exceeds 24 -- a single day
+        cannot physically contain more than 24 hours, so any row like this
+        almost certainly reflects a data-entry error in the source sheet
+        (e.g. a pasted period total landing in a single daily row) and is
+        surfaced for the person to check, never silently dropped or capped.
+    """
     xls = pd.ExcelFile(file)
     frames = []
+    diag_mismatch_rows = 0
+    diag_mismatch_hours = 0.0
+    diag_implausible = []
 
     for sheet in xls.sheet_names:
         if _norm(sheet) in SKIP_SHEETS:
@@ -332,12 +353,26 @@ def parse_workbook(file) -> pd.DataFrame:
 
         body[hour_cols] = body[hour_cols].fillna(0.0)
 
+        # Total Hours is ALWAYS derived as Billable + Non-Billable + Hours Not
+        # Worked -- never trusted from the sheet as an independently-entered
+        # figure, even when the sheet's own Total Hours cell is present and
+        # non-zero. (The previous rule only recomputed it when the sheet's
+        # value was blank/zero, which let a stale or manually-typed Total
+        # Hours cell silently disagree with its own three components on some
+        # rows. That single inconsistency was the reason the donut charts,
+        # the Utilization Breakdown panel, the Per-QA Summary Table, and the
+        # KPI tiles could each show a slightly different percentage for the
+        # same period -- each was summing a different, sometimes-mismatched
+        # "Total Hours" column. Deriving it the same way everywhere, from the
+        # same three logged numbers, is what makes every figure in the tool
+        # reconcile exactly.)
         computed_total = body["Billable Hours"] + body["Non-Billable Hours"] + body["Hours Not Worked"]
-        body["Total Hours"] = np.where(
-            (body["Total Hours"] <= 0) | (body["Total Hours"].isna()),
-            computed_total,
-            body["Total Hours"],
-        )
+        sheet_total = body["Total Hours"]
+        mismatch = (sheet_total > 0) & ((sheet_total - computed_total).abs() > 0.01)
+        if mismatch.any():
+            diag_mismatch_rows += int(mismatch.sum())
+            diag_mismatch_hours += float((sheet_total[mismatch] - computed_total[mismatch]).abs().sum())
+        body["Total Hours"] = computed_total
 
         body["Day"] = body["Date"].dt.day_name().str.slice(0, 3)
         body["Month"] = body["Date"].dt.strftime("%b")
@@ -353,16 +388,27 @@ def parse_workbook(file) -> pd.DataFrame:
         body["QA Name"] = body["QA Name"].str.replace(r"\s+", " ", regex=True).str.strip()
         body["QA Name"] = body["QA Name"].str.title()
 
+        implausible = body[body["Total Hours"] > 24]
+        for _, r in implausible.iterrows():
+            if len(diag_implausible) < 15:
+                diag_implausible.append((str(r["QA Name"]), r["Date"], float(r["Total Hours"])))
+
         final = body[["QA Name", "Date", "Day", "Month", "Year",
                       "Billable Hours", "Non-Billable Hours",
                       "Hours Not Worked", "Total Hours", "Comment"]].copy()
         final = final[final["QA Name"] != ""]
         frames.append(final)
 
+    diagnostics = {
+        "total_mismatch_rows": diag_mismatch_rows,
+        "total_mismatch_hours": round(diag_mismatch_hours, 1),
+        "implausible_rows": diag_implausible,
+    }
+
     if not frames:
         return pd.DataFrame(columns=["QA Name", "Date", "Day", "Month", "Year",
                                       "Billable Hours", "Non-Billable Hours",
-                                      "Hours Not Worked", "Total Hours", "Comment"])
+                                      "Hours Not Worked", "Total Hours", "Comment"]), diagnostics
 
     out = pd.concat(frames, ignore_index=True)
     out = out.drop_duplicates(subset=["QA Name", "Date"], keep="first")
@@ -371,7 +417,7 @@ def parse_workbook(file) -> pd.DataFrame:
     out = out[out["Date"] <= TODAY]
 
     out = out.sort_values(["QA Name", "Date"]).reset_index(drop=True)
-    return out
+    return out, diagnostics
 
 
 # ============================================================================
@@ -717,6 +763,159 @@ def _mpl_fig_png(fig, plt, dpi=200):
     return b.getvalue()
 
 
+def _scaled_image_size(png_bytes, target_w=None, target_h=None):
+    """Return (width, height) for placing this PNG in the PDF/Excel export,
+    preserving its TRUE pixel aspect ratio -- pass exactly one of target_w /
+    target_h and the other side is derived from the image itself.
+
+    matplotlib's bbox_inches="tight" (see _mpl_fig_png) crops each chart to
+    its actual content, so the final pixel aspect ratio isn't a fixed,
+    predictable number: the donut's legend, the number of QAs on an axis, and
+    how far long names push a rotated-label chart's bottom edge down all
+    shift it slightly. Reading the real dimensions back out of the PNG here
+    (once, at export time) means the displayed image is never stretched or
+    squashed to fit a guessed aspect ratio, and stays correct automatically
+    if a chart's layout ever changes again."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(png_bytes))
+    iw, ih = img.size
+    aspect = iw / ih if ih else 1.0
+    if target_w is not None:
+        return target_w, target_w / aspect
+    if target_h is not None:
+        return target_h * aspect, target_h
+    return float(iw), float(ih)
+
+
+# ============================================================================
+# CJK TEXT SUPPORT FOR THE PDF EXPORT
+# ----------------------------------------------------------------------------
+# The Daily Log's Comment column can contain real Korean and Japanese text
+# (this dashboard tracks BMW/MINI markets that include both), plus the
+# occasional non-Latin symbol like the rupee sign. ReportLab's built-in
+# Helvetica font only covers WinAnsi/Latin-1, and its "reference only" CID
+# CJK fonts (e.g. UnicodeCIDFont) depend on the PDF VIEWER already having a
+# matching CJK language pack -- which isn't guaranteed (or even common) on an
+# arbitrary machine, and showed up as solid black boxes in testing. The fix
+# used here instead EMBEDS real TrueType fonts directly in the PDF, so the
+# glyphs are self-contained and render correctly everywhere, with no
+# dependency on the viewer's own fonts.
+# ============================================================================
+
+def _app_dir():
+    """Directory this script (or, when frozen by PyInstaller, the bundled
+    data) lives in -- used to find the fonts/ folder regardless of the
+    current working directory the app was launched from."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_CJK_FONTS_READY = None  # None = not yet attempted; True/False once resolved
+_CJK_CMAPS = {}          # font name -> set of covered Unicode codepoints
+
+
+def _register_cjk_fonts():
+    """Register the embedded Korean (NanumGothic), Japanese (VLGothic), and
+    general Unicode-symbol (DejaVuSans) TrueType fonts, once per process.
+    Safe to call repeatedly -- does nothing after the first successful (or
+    failed) attempt. Returns True if CJK-capable fonts are available, False
+    if the font files are missing (e.g. the fonts/ folder wasn't copied
+    alongside app.py) -- in which case callers fall back to Helvetica-only
+    rendering rather than crashing the export."""
+    global _CJK_FONTS_READY
+    if _CJK_FONTS_READY is not None:
+        return _CJK_FONTS_READY
+
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from fontTools.ttLib import TTFont as FTFont
+
+        fonts_dir = os.path.join(_app_dir(), "fonts")
+        specs = [
+            ("NanumGothic", "NanumGothic.ttf"),
+            ("VLGothic", "VLGothic-Regular.ttf"),
+            ("DejaVuSans", "DejaVuSans.ttf"),
+        ]
+        for name, fname in specs:
+            path = os.path.join(fonts_dir, fname)
+            if name not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont(name, path))
+            if name not in _CJK_CMAPS:
+                _CJK_CMAPS[name] = set(FTFont(path).getBestCmap().keys())
+        _CJK_FONTS_READY = True
+    except Exception:
+        # Missing/unreadable font files, bad install, etc. -- export still
+        # proceeds, just without CJK glyph support (same behavior as before
+        # this feature existed, not a new failure mode).
+        _CJK_FONTS_READY = False
+    return _CJK_FONTS_READY
+
+
+def _is_hangul(cp):
+    return 0xAC00 <= cp <= 0xD7A3 or 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F
+
+
+def _is_kana_or_han(cp):
+    return 0x3040 <= cp <= 0x30FF or 0x4E00 <= cp <= 0x9FFF or 0x3000 <= cp <= 0x303F
+
+
+def _winansi_ok(ch):
+    try:
+        ch.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _pick_char_font(ch):
+    """Which registered font should render this one character. Order
+    matters: Hangul and Kana/Han are checked first since those scripts are
+    the actual reason this machinery exists; plain WinAnsi-safe text (the
+    overwhelming majority of any comment) stays on Helvetica to match the
+    rest of the table; DejaVuSans is the general Unicode fallback for
+    anything else (e.g. the rupee sign, which none of the CJK fonts cover)."""
+    cp = ord(ch)
+    if _is_hangul(cp):
+        return "NanumGothic"
+    if _is_kana_or_han(cp):
+        return "VLGothic"
+    if _winansi_ok(ch):
+        return "Helvetica"
+    if cp in _CJK_CMAPS.get("DejaVuSans", ()):
+        return "DejaVuSans"
+    return "Helvetica"  # last-resort; a missing glyph here is a rare, truly exotic character
+
+
+def _comment_markup(text):
+    """Turn a raw comment string into ReportLab Paragraph XML that switches
+    fonts per contiguous script run, so Korean, Japanese, and ordinary text
+    within the SAME comment all render with a font that actually has those
+    glyphs -- instead of one font for the whole cell. Falls back to plain
+    (Helvetica-only, still properly escaped) markup if the CJK fonts aren't
+    available in this environment."""
+    from xml.sax.saxutils import escape
+    text = "" if text is None else str(text)
+    if not text:
+        return ""
+    if not _register_cjk_fonts():
+        return escape(text)
+
+    runs = []
+    cur_font = _pick_char_font(text[0])
+    cur_text = text[0]
+    for ch in text[1:]:
+        f = _pick_char_font(ch)
+        if f == cur_font:
+            cur_text += ch
+        else:
+            runs.append((cur_font, cur_text))
+            cur_font, cur_text = f, ch
+    runs.append((cur_font, cur_text))
+    return "".join(f'<font name="{f}">{escape(t)}</font>' for f, t in runs)
+
+
 def mpl_team_donut(billable, nonbill, notworked):
     """Big team-utilization donut: three slices + center utilization %, with a
     compact legend baked in so the image is self-contained."""
@@ -798,7 +997,7 @@ def mpl_hours_mix(summary_df):
     non = grp["Non-Billable Hours"].tolist()
     notw = grp["Hours Not Worked"].tolist()
 
-    fig, ax = plt.subplots(figsize=(12.0, 2.95))
+    fig, ax = plt.subplots(figsize=(12.0, 3.55))
     x = list(range(len(names)))
     ax.bar(x, bill, color=BILLABLE_COLOR, label="Billable", width=0.62)
     ax.bar(x, non, bottom=bill, color=NONBILL_COLOR, label="Non-Billable", width=0.62)
@@ -806,7 +1005,10 @@ def mpl_hours_mix(summary_df):
     ax.bar(x, notw, bottom=bottom2, color=NOTWORKED_COLOR, label="Not Worked", width=0.62)
     ax.set_ylabel("Hours", fontsize=10, color=TEXT_MUTED)
     ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=25, ha="right", fontsize=9)
+    # rotation=30 + a generous bottom margin below (see subplots_adjust and the
+    # legend's bbox_to_anchor) keeps long names like "Saujanya Gouda" clear of
+    # the legend beneath them, instead of the two overlapping.
+    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=9)
     ax.grid(axis="y", color=BORDER, linewidth=0.8)
     ax.set_axisbelow(True)
     for s in ["top", "right"]:
@@ -815,9 +1017,11 @@ def mpl_hours_mix(summary_df):
     ax.spines["bottom"].set_color(BORDER)
     ax.tick_params(length=0, labelsize=9, colors=TEXT_MUTED)
     ax.tick_params(axis="x", colors=TEXT_MAIN)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=3,
+    # Anchored well below the rotated labels' lowest descender (not just
+    # beneath the axis) so long names never run into the legend row.
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.42), ncol=3,
               frameon=False, fontsize=10)
-    fig.subplots_adjust(left=0.06, right=0.99, top=0.98, bottom=0.28)
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.98, bottom=0.40)
     return _mpl_fig_png(fig, plt)
 
 
@@ -945,11 +1149,17 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, char
                 # charts are wide.
                 low = title.lower()
                 if "donut" in low or "utilization" in low:
-                    img.width, img.height = 340, 340
+                    img.width, img.height = _scaled_image_size(png, target_w=340)
                 else:
-                    img.width, img.height = 700, 188
+                    img.width, img.height = _scaled_image_size(png, target_w=760)
                 ws.add_image(img, f"B{row_cursor}")
-                row_cursor += 20
+                # Excel's default row height is ~20px, so convert the image's
+                # actual (aspect-preserved, therefore variable) pixel height
+                # into a row count instead of a fixed guess -- otherwise a
+                # taller-than-assumed chart (e.g. the donut's legend, or a
+                # Hours Mix chart with long rotated names) would overlap the
+                # next title instead of clearing it.
+                row_cursor += int(img.height / 20) + 3
             else:
                 images_failed = True
                 ws[f"B{row_cursor}"] = "(chart image unavailable — see chart data in the tables below)"
@@ -969,7 +1179,7 @@ def to_excel_bytes(summary_df, detail_df, kpis, period_label, chart_titles, char
             png = mini_pngs.get(qa_name)
             if png is not None:
                 img = XLImage(io.BytesIO(png))
-                img.width, img.height = 220, 220
+                img.width, img.height = _scaled_image_size(png, target_w=210)
                 ws.add_image(img, f"{col}{r + 1}")
             else:
                 images_failed = True
@@ -1079,12 +1289,14 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_
     # Landscape A4 usable width with 12mm side margins ~= 273mm -> 774pt.
     PAGE_W, PAGE_H = landscape(A4)
     L_MARGIN = R_MARGIN = 12 * mm
+    T_MARGIN = B_MARGIN = 13 * mm
     CONTENT_W = PAGE_W - L_MARGIN - R_MARGIN  # ~ 773pt
+    CONTENT_H = PAGE_H - T_MARGIN - B_MARGIN  # usable height on any one page
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A4),
-        topMargin=13 * mm, bottomMargin=13 * mm,
+        topMargin=T_MARGIN, bottomMargin=B_MARGIN,
         leftMargin=L_MARGIN, rightMargin=R_MARGIN,
         title="QA Work Hours Dashboard Report",
     )
@@ -1299,7 +1511,13 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_
 
         # ---- Left: donut card ----
         if donut_title and donut_title in chart_by_title:
-            donut_body = RLImage(io.BytesIO(chart_by_title[donut_title]), width=286, height=250)
+            # Sized by target HEIGHT (not width): the donut's real aspect
+            # ratio (with its legend) is taller than the card is wide, so
+            # controlling height keeps this card visually balanced against
+            # the breakdown panel beside it rather than growing tall and
+            # leaving the panel looking short by comparison.
+            dw, dh = _scaled_image_size(chart_by_title[donut_title], target_h=250)
+            donut_body = RLImage(io.BytesIO(chart_by_title[donut_title]), width=dw, height=dh)
         else:
             donut_body = Paragraph(
                 f"<b>{kpis.get('utilization', 0):.1f}%</b> utilization",
@@ -1401,8 +1619,30 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_
             elements.append(HRule(CONTENT_W))
             elements.append(Spacer(1, 12))
 
-            def _wide_chart_card(title_text, png, img_h):
-                body = RLImage(io.BytesIO(png), width=CONTENT_W - 44, height=img_h)
+            # Both charts default to full content width, but when BOTH are
+            # present, shrink them together (same width for each, so they
+            # still line up) just enough that they're guaranteed to fit on
+            # this one page below the header -- rather than a fixed width
+            # that happens to work for one chart's shape but pushes a taller
+            # one (e.g. Hours Mix, which needs extra room for long rotated
+            # names above its legend) onto its own mostly-empty page.
+            CARD_OVERHEAD = 25 + 12  # per-card padding + title line, matches _wide_chart_card below
+            HEADER_USED = 52         # section title + subtitle + rule + spacers above, approx
+            max_w = CONTENT_W - 44
+            present = [t for t in (bar_title, mix_title) if t in chart_by_title]
+            if len(present) == 2:
+                budget_h = CONTENT_H - HEADER_USED - 12 - 2 * CARD_OVERHEAD  # 12 = spacer between cards
+                inv_aspect_sum = 0.0
+                for t in present:
+                    _iw, _ih = _scaled_image_size(chart_by_title[t], target_w=1000.0)
+                    inv_aspect_sum += _ih / 1000.0  # 1/aspect for this chart
+                if inv_aspect_sum > 0:
+                    fit_w = budget_h / inv_aspect_sum
+                    max_w = max(320.0, min(max_w, fit_w * 0.96))  # 4% safety margin, floor so it's never tiny
+
+            def _wide_chart_card(title_text, png):
+                disp_w, disp_h = _scaled_image_size(png, target_w=max_w)
+                body = RLImage(io.BytesIO(png), width=disp_w, height=disp_h)
                 card = Table([[Paragraph(title_text, st_chart_cap)], [body]],
                              colWidths=[CONTENT_W])
                 card.setStyle(TableStyle([
@@ -1422,11 +1662,11 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_
 
             if bar_title in chart_by_title:
                 elements.append(_wide_chart_card("QA Comparison — Total Hours",
-                                                 chart_by_title[bar_title], 167))
+                                                 chart_by_title[bar_title]))
                 elements.append(Spacer(1, 12))
             if mix_title in chart_by_title:
                 elements.append(_wide_chart_card("Hours Mix — Billable / Non-Billable / Not Worked",
-                                                 chart_by_title[mix_title], 176))
+                                                 chart_by_title[mix_title]))
 
         # ---- Fallback when NO chart images are available at all ----------
         if not chart_by_title:
@@ -1493,7 +1733,8 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_
             if include_images:
                 png = mini_pngs.get(qa_name)
                 if png is not None:
-                    img = RLImage(io.BytesIO(png), width=img_size, height=img_size)
+                    dw, dh = _scaled_image_size(png, target_w=img_size)
+                    img = RLImage(io.BytesIO(png), width=dw, height=dh)
             body = img if img is not None else Paragraph(
                 "(image<br/>unavailable)", _p("nu", fontSize=8, leading=10,
                                               textColor=C_MUTED, alignment=TA_CENTER))
@@ -1644,7 +1885,16 @@ def to_pdf_bytes(summary_df, detail_df, kpis, period_label, chart_titles, chart_
         truncated = len(log_for_pdf) > MAX_PDF_LOG_ROWS
         log_for_pdf_show = log_for_pdf.head(MAX_PDF_LOG_ROWS)
 
-        log_table_data = [log_cols] + log_for_pdf_show.round(2).astype(str).values.tolist()
+        st_comment = _p("comment", fontSize=7.5, leading=10, textColor=C_TEXT, alignment=TA_LEFT)
+        body_rows = log_for_pdf_show.round(2).astype(str).values.tolist()
+        for r in body_rows:
+            # Comment is the only free-text column a person could type CJK,
+            # currency symbols, or "&"/"<" into -- render it as a Paragraph
+            # with per-script font runs so all of that displays correctly;
+            # the other seven columns are controlled/numeric and stay as
+            # plain strings under the table's default Helvetica style.
+            r[7] = Paragraph(_comment_markup(r[7]), st_comment)
+        log_table_data = [log_cols] + body_rows
         log_col_widths = [64, 38, 92, 66, 78, 72, 66, 297]
         log_tbl = Table(log_table_data, colWidths=log_col_widths, repeatRows=1)
         log_tbl.setStyle(TableStyle([
@@ -1699,11 +1949,39 @@ if uploaded is None:
     st.stop()
 
 with st.spinner("Reading and analyzing the workbook..."):
-    data = parse_workbook(uploaded)
+    data, parse_diagnostics = parse_workbook(uploaded)
 
 if data.empty:
     st.error("Couldn't find any recognizable QA hour records in this workbook (or all rows were in the future). Please check the sheet format.")
     st.stop()
+
+# Quiet, non-blocking data-quality note -- only shown when there's something
+# to report, and only ever informational (nothing here alters or drops any
+# of the person's data; it explains a figure and flags rows worth a look).
+_mismatch_n = parse_diagnostics.get("total_mismatch_rows", 0)
+_implausible = parse_diagnostics.get("implausible_rows", [])
+if _mismatch_n or _implausible:
+    with st.expander("\u2139\ufe0f Data quality notes from this upload", expanded=False):
+        if _mismatch_n:
+            st.caption(
+                f"On {_mismatch_n} row(s), the sheet's own **Total Hours** cell didn't equal "
+                f"**Billable + Non-Billable + Hours Not Worked** for that day "
+                f"(about {parse_diagnostics.get('total_mismatch_hours', 0):,.1f} hrs of drift in total). "
+                "Every figure in this dashboard \u2014 KPIs, charts, the summary table, and both "
+                "exports \u2014 uses **Billable + Non-Billable + Hours Not Worked** as Total Hours "
+                "consistently, rather than the sheet's own Total Hours cell, so all numbers here "
+                "reconcile with each other."
+            )
+        if _implausible:
+            st.caption(
+                f"{len(_implausible)} row(s) show more than 24 logged hours in a single day, which "
+                "isn't physically possible \u2014 likely a data-entry issue in the source sheet "
+                "(e.g. a period total pasted into one daily row). Nothing was changed or excluded; "
+                "worth checking these directly in the workbook:"
+            )
+            for _name, _date, _val in _implausible[:15]:
+                _date_str = pd.to_datetime(_date).strftime("%d %b %Y") if pd.notna(_date) else "unknown date"
+                st.caption(f"\u2022 {_name} \u2014 {_date_str} \u2014 {_val:,.1f} hrs")
 
 # ============================================================================
 # SIDEBAR FILTERS
