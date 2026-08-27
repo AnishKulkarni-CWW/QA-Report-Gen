@@ -305,6 +305,17 @@ def parse_workbook(file):
         empty cells rather than a "Sat"/"Sun"/"SL" token). These are never
         counted as a worked day; without this they show up as phantom
         0-hour days that dilute daily averages and inflate day-counts.
+      - "total_missing_rows": count of rows dropped because at least one
+        of the three component columns (Billable / Non-Billable / Hours
+        Not Worked) had data entered, but the sheet's own Total Hours
+        cell was left blank/zero. A day only counts toward any
+        calculation in this dashboard when the sheet's own Total Hours
+        cell is actually filled in -- these rows are excluded entirely,
+        never backfilled from the components.
+      - "total_missing_detail": up to 50 (QA Name, Date, Billable,
+        Non-Billable, Hours Not Worked) tuples for the SAME rows counted
+        in total_missing_rows -- lets the UI list exactly which QA/date
+        combinations are missing their Total Hours entry.
     """
     xls = pd.ExcelFile(file)
     frames = []
@@ -313,6 +324,8 @@ def parse_workbook(file):
     diag_implausible = []
     diag_mismatch_detail = []
     diag_blank_dropped = 0
+    diag_missing_rows = 0
+    diag_missing_detail = []
 
     for sheet in xls.sheet_names:
         if _norm(sheet) in SKIP_SHEETS:
@@ -379,21 +392,44 @@ def parse_workbook(file):
         if body.empty:
             continue
 
+        # Before filling NaN component cells with 0, capture which rows had
+        # a blank/zero Total Hours cell in the sheet WHILE at least one of
+        # the three component columns actually had something entered. Those
+        # rows must never be counted in any calculation (a day is only
+        # "logged" once its own Total Hours cell is filled in) -- e.g. 8
+        # hours sitting in Non-Billable with nothing in Total Hours is not a
+        # valid day and must be excluded, not backfilled to 8 by summing
+        # the components ourselves.
+        _components_present = body[component_cols].notna().any(axis=1)
+        _total_missing = body["Total Hours"].isna() | (body["Total Hours"].fillna(0) <= 0)
+        missing_total_mask = _components_present & _total_missing
+        if missing_total_mask.any():
+            diag_missing_rows_local = body.loc[missing_total_mask]
+            diag_missing_rows_count = int(missing_total_mask.sum())
+            for idx, r in diag_missing_rows_local.iterrows():
+                if len(diag_missing_detail) < 50:
+                    diag_missing_detail.append((
+                        str(r["QA Name"]) if "QA Name" in r else sheet,
+                        r["Date"],
+                        float(r["Billable Hours"]) if pd.notna(r["Billable Hours"]) else 0.0,
+                        float(r["Non-Billable Hours"]) if pd.notna(r["Non-Billable Hours"]) else 0.0,
+                        float(r["Hours Not Worked"]) if pd.notna(r["Hours Not Worked"]) else 0.0,
+                    ))
+            diag_missing_rows += diag_missing_rows_count
+        body = body[~missing_total_mask]
+        if body.empty:
+            continue
+
         body[hour_cols] = body[hour_cols].fillna(0.0)
 
-        # Total Hours is ALWAYS derived as Billable + Non-Billable + Hours Not
-        # Worked -- never trusted from the sheet as an independently-entered
-        # figure, even when the sheet's own Total Hours cell is present and
-        # non-zero. (The previous rule only recomputed it when the sheet's
-        # value was blank/zero, which let a stale or manually-typed Total
-        # Hours cell silently disagree with its own three components on some
-        # rows. That single inconsistency was the reason the donut charts,
-        # the Utilization Breakdown panel, the Per-QA Summary Table, and the
-        # KPI tiles could each show a slightly different percentage for the
-        # same period -- each was summing a different, sometimes-mismatched
-        # "Total Hours" column. Deriving it the same way everywhere, from the
-        # same three logged numbers, is what makes every figure in the tool
-        # reconcile exactly.)
+        # Total Hours is now taken directly from the sheet's own cell (never
+        # recomputed from the three components) -- a day only counts toward
+        # any calculation in this dashboard when that cell is actually
+        # filled in and non-zero; rows failing that were already dropped
+        # above. We still cross-check the sheet's Total Hours against the
+        # sum of the three components purely as an informational diagnostic
+        # (source-sheet typos worth fixing at the root), without altering
+        # the value used anywhere in the app.
         computed_total = body["Billable Hours"] + body["Non-Billable Hours"] + body["Hours Not Worked"]
         sheet_total = body["Total Hours"]
         mismatch = (sheet_total > 0) & ((sheet_total - computed_total).abs() > 0.01)
@@ -409,7 +445,8 @@ def parse_workbook(file):
                         float(sheet_total.loc[idx]),
                         float(computed_total.loc[idx]),
                     ))
-        body["Total Hours"] = computed_total
+        # Total Hours stays exactly as entered on the sheet (sheet_total) --
+        # it is not overwritten with computed_total.
 
         body["Day"] = body["Date"].dt.day_name().str.slice(0, 3)
         body["Month"] = body["Date"].dt.strftime("%b")
@@ -442,6 +479,8 @@ def parse_workbook(file):
         "implausible_rows": diag_implausible,
         "mismatch_detail": diag_mismatch_detail,
         "blank_rows_dropped": diag_blank_dropped,
+        "total_missing_rows": diag_missing_rows,
+        "total_missing_detail": diag_missing_detail,
     }
 
     if not frames:
@@ -1994,6 +2033,46 @@ if data.empty:
     st.error("Couldn't find any recognizable QA hour records in this workbook (or all rows were in the future). Please check the sheet format.")
     st.stop()
 
+# ---- Prominent red banner: rows with hours entered but no Total Hours ----
+# These rows were excluded from every calculation in the dashboard (they are
+# not in `data` at all) because the sheet's own Total Hours cell was left
+# blank/zero even though Billable / Non-Billable / Hours Not Worked had data
+# entered. Flagged loudly at the very top so it's impossible to miss.
+_missing_total_n = parse_diagnostics.get("total_missing_rows", 0)
+_missing_total_detail = parse_diagnostics.get("total_missing_detail", [])
+if _missing_total_n:
+    _lines = []
+    for _name, _date, _bill, _nonbill, _notworked in _missing_total_detail:
+        _date_str = pd.to_datetime(_date).strftime("%d %b %Y") if pd.notna(_date) else "unknown date"
+        _parts = []
+        if _bill:
+            _parts.append(f"Billable {_bill:.1f}")
+        if _nonbill:
+            _parts.append(f"Non-Billable {_nonbill:.1f}")
+        if _notworked:
+            _parts.append(f"Not Worked {_notworked:.1f}")
+        _parts_str = ", ".join(_parts) if _parts else "hours entered"
+        _lines.append(f"<b>{_name}</b> &mdash; {_date_str} &mdash; {_parts_str}, but <b>Total Hours</b> is blank")
+    _shown = _lines[:50]
+    _more = _missing_total_n - len(_shown)
+    _list_html = "<br>".join(_shown)
+    if _more > 0:
+        _list_html += f"<br>&hellip; and {_more} more row(s)"
+    st.markdown(
+        f"""
+        <div style="background:#FDECEA; border:1.5px solid #C1543D; border-radius:10px;
+                    padding:12px 16px; margin-bottom:16px; color:#7A2E20;">
+            <div style="font-weight:800; font-size:0.95rem; margin-bottom:6px;">
+                &#9888;&#65039; Total Hours not entered for {_missing_total_n} row(s) &mdash; these day(s) are EXCLUDED from all calculations below
+            </div>
+            <div style="font-size:0.82rem; max-height:160px; overflow-y:auto; line-height:1.6;">
+                {_list_html}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # Quiet, non-blocking data-quality note -- only shown when there's something
 # to report, and only ever informational (nothing here alters or drops any
 # of the person's data; it explains a figure and flags rows worth a look).
@@ -2009,9 +2088,9 @@ if _mismatch_n or _implausible or _blank_dropped:
                 f"**Billable + Non-Billable + Hours Not Worked** for that day "
                 f"(about {parse_diagnostics.get('total_mismatch_hours', 0):,.1f} hrs of drift in total). "
                 "Every figure in this dashboard \u2014 KPIs, charts, the summary table, and both "
-                "exports \u2014 uses **Billable + Non-Billable + Hours Not Worked** as Total Hours "
-                "consistently, rather than the sheet's own Total Hours cell, so all numbers here "
-                "reconcile with each other. These are source-sheet typos worth fixing at the root:"
+                "exports \u2014 uses the sheet's own **Total Hours** cell as entered (never "
+                "recomputed from the three components), so these are source-sheet typos worth "
+                "fixing at the root:"
             )
             for _name, _date, _sheet_val, _computed_val in _mismatch_detail:
                 _date_str = pd.to_datetime(_date).strftime("%d %b %Y") if pd.notna(_date) else "unknown date"
