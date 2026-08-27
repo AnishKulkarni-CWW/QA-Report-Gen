@@ -294,12 +294,25 @@ def parse_workbook(file):
         almost certainly reflects a data-entry error in the source sheet
         (e.g. a pasted period total landing in a single daily row) and is
         surfaced for the person to check, never silently dropped or capped.
+      - "mismatch_detail": up to 25 (QA Name, Date, sheet_total,
+        computed_total) tuples for the SAME rows counted in
+        total_mismatch_rows -- lets the UI list exactly which rows/dates
+        disagree with their own Total Hours cell, not just a count.
+      - "blank_rows_dropped": count of rows dropped because all three
+        logged components (Billable / Non-Billable / Hours Not Worked)
+        were blank for that date -- i.e. no data was ever entered for that
+        day (an unfilled future date, or a weekend/leave row recorded as
+        empty cells rather than a "Sat"/"Sun"/"SL" token). These are never
+        counted as a worked day; without this they show up as phantom
+        0-hour days that dilute daily averages and inflate day-counts.
     """
     xls = pd.ExcelFile(file)
     frames = []
     diag_mismatch_rows = 0
     diag_mismatch_hours = 0.0
     diag_implausible = []
+    diag_mismatch_detail = []
+    diag_blank_dropped = 0
 
     for sheet in xls.sheet_names:
         if _norm(sheet) in SKIP_SHEETS:
@@ -347,7 +360,22 @@ def parse_workbook(file):
                 body[c] = np.nan
 
         hour_cols = ["Billable Hours", "Non-Billable Hours", "Hours Not Worked", "Total Hours"]
-        body = body[~body[hour_cols].isna().all(axis=1)]
+        # A row is "no data for this day" -- and must be dropped, not kept as
+        # a phantom zero-hour day -- whenever its three LOGGED components
+        # (Billable / Non-Billable / Hours Not Worked) are all blank. This
+        # covers both spellings of an off day: a weekend/leave row where
+        # every cell holds a token like "Sat"/"Sun"/"SL" (all four columns
+        # become NaN after _to_number), AND a row where the three component
+        # cells were simply never filled in but Total Hours still holds a
+        # leftover formula result of 0 (three NaN + one 0 previously slipped
+        # past this filter because it only required ALL FOUR to be blank --
+        # Payal's sheet alone contributed 50 such phantom 0-hour rows for
+        # unfilled/future dates, inflating her active-day counts and pulling
+        # down her daily averages).
+        component_cols = ["Billable Hours", "Non-Billable Hours", "Hours Not Worked"]
+        blank_mask = body[component_cols].isna().all(axis=1)
+        diag_blank_dropped += int(blank_mask.sum())
+        body = body[~blank_mask]
         if body.empty:
             continue
 
@@ -372,6 +400,15 @@ def parse_workbook(file):
         if mismatch.any():
             diag_mismatch_rows += int(mismatch.sum())
             diag_mismatch_hours += float((sheet_total[mismatch] - computed_total[mismatch]).abs().sum())
+            mismatch_qa = body.loc[mismatch, "QA Name"] if "QA Name" in body.columns else pd.Series([sheet] * int(mismatch.sum()), index=body.index[mismatch])
+            for idx in body.index[mismatch]:
+                if len(diag_mismatch_detail) < 25:
+                    diag_mismatch_detail.append((
+                        str(mismatch_qa.loc[idx]) if idx in mismatch_qa.index else sheet,
+                        body.loc[idx, "Date"],
+                        float(sheet_total.loc[idx]),
+                        float(computed_total.loc[idx]),
+                    ))
         body["Total Hours"] = computed_total
 
         body["Day"] = body["Date"].dt.day_name().str.slice(0, 3)
@@ -403,6 +440,8 @@ def parse_workbook(file):
         "total_mismatch_rows": diag_mismatch_rows,
         "total_mismatch_hours": round(diag_mismatch_hours, 1),
         "implausible_rows": diag_implausible,
+        "mismatch_detail": diag_mismatch_detail,
+        "blank_rows_dropped": diag_blank_dropped,
     }
 
     if not frames:
@@ -1960,8 +1999,10 @@ if data.empty:
 # of the person's data; it explains a figure and flags rows worth a look).
 _mismatch_n = parse_diagnostics.get("total_mismatch_rows", 0)
 _implausible = parse_diagnostics.get("implausible_rows", [])
-if _mismatch_n or _implausible:
-    with st.expander("\u2139\ufe0f Data quality notes from this upload", expanded=False):
+_mismatch_detail = parse_diagnostics.get("mismatch_detail", [])
+_blank_dropped = parse_diagnostics.get("blank_rows_dropped", 0)
+if _mismatch_n or _implausible or _blank_dropped:
+    with st.expander(f"\u2139\ufe0f Data quality notes from this upload ({_mismatch_n} total-mismatch row(s))", expanded=bool(_mismatch_n or _implausible)):
         if _mismatch_n:
             st.caption(
                 f"On {_mismatch_n} row(s), the sheet's own **Total Hours** cell didn't equal "
@@ -1970,7 +2011,19 @@ if _mismatch_n or _implausible:
                 "Every figure in this dashboard \u2014 KPIs, charts, the summary table, and both "
                 "exports \u2014 uses **Billable + Non-Billable + Hours Not Worked** as Total Hours "
                 "consistently, rather than the sheet's own Total Hours cell, so all numbers here "
-                "reconcile with each other."
+                "reconcile with each other. These are source-sheet typos worth fixing at the root:"
+            )
+            for _name, _date, _sheet_val, _computed_val in _mismatch_detail:
+                _date_str = pd.to_datetime(_date).strftime("%d %b %Y") if pd.notna(_date) else "unknown date"
+                st.caption(
+                    f"\u2022 {_name} \u2014 {_date_str} \u2014 sheet said {_sheet_val:,.1f} hrs, "
+                    f"components add up to {_computed_val:,.1f} hrs"
+                )
+        if _blank_dropped:
+            st.caption(
+                f"{_blank_dropped} row(s) had no Billable / Non-Billable / Hours Not Worked entered at "
+                "all (blank cells, not a Sat/Sun/leave marker) \u2014 these are treated as no data for "
+                "that day and excluded from every total, rather than counted as a 0-hour work day."
             )
         if _implausible:
             st.caption(
@@ -2145,14 +2198,15 @@ kpis = dict(team_size=team_size, billable=billable_total, nonbill=nonbill_total,
 
 st.markdown(f'<div class="panel-title" style="margin-bottom:12px;">QA &mdash; {period_label}</div>', unsafe_allow_html=True)
 
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 kpi_cells = [
     (k1, "QA TEAM SIZE", f"{team_size}", "active members"),
     (k2, "TOTAL HOURS", f"{total_hours:,.1f}", f"across {days_logged} days"),
     (k3, "BILLABLE SHARE", f"{utilization:.1f}%", f"{billable_total:,.0f} of {total_hours:,.0f} hrs"),
     (k4, "AVG HOURS / DAY", f"{avg_hours_per_day:.2f}", "per active QA-day"),
-    (k5, "NON-BILLABLE HOURS", f"{nonbill_total:,.1f}", "hrs logged"),
-    (k6, "HOURS NOT WORKED", f"{notworked_total:,.1f}", "hrs logged"),
+    (k5, "BILLABLE HOURS", f"{billable_total:,.1f}", "hrs logged"),
+    (k6, "NON-BILLABLE HOURS", f"{nonbill_total:,.1f}", "hrs logged"),
+    (k7, "HOURS NOT WORKED", f"{notworked_total:,.1f}", "hrs logged"),
 ]
 for col, label, val, sub in kpi_cells:
     with col:
